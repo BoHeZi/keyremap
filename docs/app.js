@@ -93,7 +93,7 @@ function parseValue(raw) {
  */
 function parseToml(text) {
   const lines = text.split(/\r?\n/);
-  const out = { header: '', name: '', groupEnabled: {}, mappings: [], warnings: [] };
+  const out = { header: '', name: '', webUrl: '', groupEnabled: {}, mappings: [], warnings: [] };
   const headerLines = [];
   let inHeader = true;
   let section = null; // 'groups' | 'mapping'
@@ -152,6 +152,9 @@ function parseToml(text) {
       if (value === false) out.groupEnabled[key] = false;
     } else if (key === 'name') {
       out.name = String(value);
+    } else if (key === 'web_url') {
+      // 必须认识这个字段, 否则用本工具保存一次就把它吃掉了
+      out.webUrl = String(value);
     } else {
       out.warnings.push(`第 ${i + 1} 行: 位置不明的字段 ${key}`);
     }
@@ -217,6 +220,8 @@ function configApp() {
 
     header: DEFAULT_HEADER,
     name: '',
+    /** 配置里的 web_url。本工具不编辑它，但必须原样带回去，否则保存会丢字段 */
+    webUrl: '',
     /** { 组名: false } —— 只记录被关掉的组，未列出即启用 */
     groupEnabled: {},
     mappings: [],
@@ -265,6 +270,7 @@ function configApp() {
       let out = '';
       if (this.header) out += this.header + '\n\n';
       if (this.name) out += `name = "${escStr(this.name)}"\n`;
+      if (this.webUrl) out += `web_url = "${escStr(this.webUrl)}"\n`;
 
       const off = this.groups.filter((g) => this.groupEnabled[g] === false);
       if (off.length) {
@@ -343,6 +349,7 @@ function configApp() {
     newConfig() {
       this.header = DEFAULT_HEADER;
       this.name = '我的配置';
+      this.webUrl = '';
       this.groupEnabled = {};
       this.mappings = [];
       this.fileHandle = null;
@@ -378,6 +385,7 @@ function configApp() {
     applyParsed(p) {
       this.header = p.header;
       this.name = p.name;
+      this.webUrl = p.webUrl;
       this.groupEnabled = p.groupEnabled;
       this.mappings = p.mappings;
       if (p.warnings.length) {

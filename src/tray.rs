@@ -35,7 +35,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
 
-use crate::{autostart, elevate, hook, watcher};
+use crate::{autostart, config, elevate, hook, watcher};
 
 /// 托盘图标回调消息。图标上的鼠标动作都通过它送到窗口过程。
 const WM_TRAY_CALLBACK: u32 = WM_APP + 100;
@@ -53,6 +53,7 @@ const ID_QUIT: u32 = 5;
 const ID_LISTEN: u32 = 6;
 const ID_AUTOSTART: u32 = 7;
 const ID_RUNAS: u32 = 8;
+const ID_WEB_TOOL: u32 = 9;
 const ID_MAPPING_BASE: u32 = 100;
 /// 组开关的 ID 起点。取得比映射区间高很多, 免得两者撞上。
 const ID_GROUP_BASE: u32 = 10000;
@@ -242,6 +243,7 @@ unsafe fn show_menu(hwnd: HWND) {
             (ID_RELOAD, "重新加载配置"),
             (ID_OPEN_FILE, "打开配置文件"),
             (ID_OPEN_DIR, "打开配置目录"),
+            (ID_WEB_TOOL, "图形配置工具..."),
         ] {
             let w = wide(text);
             AppendMenuW(menu, MF_STRING, id as usize, w.as_ptr());
@@ -408,6 +410,31 @@ fn spawn_listen() {
     info!("已启动按键监听窗口");
 }
 
+/// 用系统浏览器打开 Web 配置工具。
+///
+/// 地址取自配置里的 `web_url`, 没写就用仓库自带的 GitHub Pages 部署。
+/// 主程序在这件事上只做一次 ShellExecuteW —— 不发请求、不解析响应,
+/// 所以"有个网页工具"并不等于"程序里有网络代码"。
+fn open_web_tool() {
+    let url = hook::config_snapshot()
+        .map(|c| c.web_url().to_string())
+        .unwrap_or_else(|| config::DEFAULT_WEB_URL.to_string());
+
+    info!("打开配置工具: {url}");
+    let target = wide(&url);
+    let verb = wide("open");
+    unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            target.as_ptr(),
+            ptr::null(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+}
+
 fn toggle_autostart() {
     let turn_on = !autostart::is_enabled();
     let result = match CONFIG_PATH.get() {
@@ -489,6 +516,7 @@ fn handle_command(id: u32) {
             }
         }
         ID_LISTEN => spawn_listen(),
+        ID_WEB_TOOL => open_web_tool(),
         ID_AUTOSTART => toggle_autostart(),
         ID_RUNAS => {
             // 只置标记, 真正的重启在 main 里做 —— 那时单实例锁已经释放

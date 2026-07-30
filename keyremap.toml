@@ -1,5 +1,9 @@
 name = "默认配置"
 
+# 托盘菜单里"图形配置工具"打开的地址。留空则用仓库自带的 GitHub Pages 部署。
+# 自己部署到别处 (比如 Cloudflare Pages) 时改这里。
+# web_url = "https://my-keyremap.pages.dev/"
+
 # 单键映射: from = "..." / to = "..."
 # 组合键映射: to 写成数组, 例如 to = ["Ctrl", "W"]
 #

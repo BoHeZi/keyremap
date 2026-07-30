@@ -27,16 +27,16 @@ Firefox / Safari 没有 FSA API，会自动落到这条路。
 `keys.js` 是从主程序导出的，**不要手改**。主程序的键名表变动后重新生成：
 
 ```bash
-keyremap-ng --dump-keys -o web/keys.json
+keyremap-ng --dump-keys -o docs/keys.json
 # 包装成 script 可加载的形式
-{ printf 'window.KEYREMAP_KEYS = '; cat web/keys.json; printf ';\n'; } > web/keys.js
+{ printf 'window.KEYREMAP_KEYS = '; cat docs/keys.json; printf ';\n'; } > docs/keys.js
 ```
 
 PowerShell：
 
 ```powershell
-.\keyremap-ng.exe --dump-keys -o web\keys.json
-"window.KEYREMAP_KEYS = " + (Get-Content web\keys.json -Raw) + ";" | Set-Content web\keys.js
+.\keyremap-ng.exe --dump-keys -o docs\keys.json
+"window.KEYREMAP_KEYS = " + (Get-Content docs\keys.json -Raw) + ";" | Set-Content docs\keys.js
 ```
 
 CI 会校验 `keys.js` 与 `--dump-keys` 的输出是否一致，不一致就构建失败。
@@ -52,6 +52,9 @@ CI 会校验 `keys.js` 与 `--dump-keys` 的输出是否一致，不一致就构
 - **按键捕获**：`Ctrl+W`、`Ctrl+T`、`Ctrl+N` 等是浏览器保留快捷键，网页收得到事件
   但阻止不了浏览器的默认行为（页面会被关掉）。所以组合键请用**修饰键勾选框**搭，
   不要整个按下去。捕获功能主要用于单键与鼠标侧键。
+- **无人引用的组声明会被清理**：`[groups]` 里写了某个组的开关，但没有任何映射
+  `group = ` 指向它，保存时这一行会消失。主程序本来也忽略这种声明（组是从映射里
+  推导出来的），所以不影响行为，但确实改动了你的文件。
 - **TOML 解析**：只覆盖本项目实际用到的子集（顶层 `name`、`[groups]` 表、
   `[[mappings]]` 数组表、字符串/布尔/单行与跨行数组）。解析不了的内容会提示出来，
   不会静默丢弃。

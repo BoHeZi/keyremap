@@ -17,12 +17,22 @@ use crate::keycode::{Input, input_from_name, name_from_mouse, name_from_vk, vk_f
 /// 未分组映射在菜单里显示的名字。
 pub const UNGROUPED_LABEL: &str = "未分组";
 
+/// Web 配置工具的默认地址 —— 仓库自带的 GitHub Pages 部署。
+///
+/// 之所以能有默认值而不牵扯任何网络代码: 主程序只是把这个地址交给
+/// ShellExecuteW 让系统浏览器去开, 自己既不发请求也不解析响应。
+pub const DEFAULT_WEB_URL: &str = "https://huanfeng.github.io/keyremap/";
+
 // ---------- 文件里的原始结构 ----------
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     name: String,
+    /// Web 配置工具的地址。留空则用 [`DEFAULT_WEB_URL`]。
+    /// 自行部署到更快的服务时改这里。
+    #[serde(default)]
+    web_url: String,
     /// 组的启用状态, 整段可选。没列出的组默认启用,
     /// 所以只想分组、不想预设开关时可以完全不写这一段。
     #[serde(default)]
@@ -135,11 +145,22 @@ impl fmt::Display for Mapping {
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub name: String,
+    /// 配置里指定的 Web 工具地址, 空表示用默认值。取值请走 [`Config::web_url`]。
+    pub web_url_override: String,
     pub groups: Vec<Group>,
     pub mappings: Vec<Mapping>,
 }
 
 impl Config {
+    /// Web 配置工具的地址: 配置里写了就用它, 否则用默认的 GitHub Pages 地址。
+    pub fn web_url(&self) -> &str {
+        if self.web_url_override.trim().is_empty() {
+            DEFAULT_WEB_URL
+        } else {
+            self.web_url_override.trim()
+        }
+    }
+
     /// 这条映射当前是否真正生效: 自身启用**且**所属组也启用。
     ///
     /// 热路径上调用, 所以是一次数组索引而非字符串查找。
@@ -298,6 +319,7 @@ pub fn parse(content: &str) -> Result<Config, String> {
 
     Ok(Config {
         name: raw.name,
+        web_url_override: raw.web_url,
         groups,
         mappings,
     })
@@ -425,6 +447,49 @@ to = "Esc"
         .unwrap();
         assert_eq!(cfg.active_count(), 0);
         assert!(cfg.needs_mouse_hook());
+    }
+
+    #[test]
+    fn 未指定时用默认的web地址() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "Pause"
+to = "Insert"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.web_url(), DEFAULT_WEB_URL);
+    }
+
+    #[test]
+    fn 配置里的web地址优先且忽略两侧空白() {
+        let cfg = parse(
+            r#"
+web_url = "  https://my.pages.dev/  "
+
+[[mappings]]
+from = "Pause"
+to = "Insert"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.web_url(), "https://my.pages.dev/");
+    }
+
+    #[test]
+    fn 空白的web地址退回默认值() {
+        let cfg = parse(
+            r#"
+web_url = "   "
+
+[[mappings]]
+from = "Pause"
+to = "Insert"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.web_url(), DEFAULT_WEB_URL);
     }
 
     #[test]

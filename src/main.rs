@@ -10,11 +10,19 @@ mod config;
 mod hook;
 mod inject;
 mod keycode;
+mod tray;
+mod watcher;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::ptr;
 
 use clap::Parser;
-use log::{LevelFilter, error, info};
+use log::{LevelFilter, error, info, warn};
+use tray_icon::menu::MenuEvent;
+use windows_sys::Win32::System::Threading::GetCurrentThreadId;
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Windows 键盘/鼠标重映射工具", long_about = None)]
@@ -71,7 +79,11 @@ fn main() {
         return;
     }
 
+    // 规范成绝对路径。相对路径的 parent() 是空串而不是 None,
+    // 会让文件监听拿不到可用的目录, 热重载直接失效。
+    // 用 absolute 而非 canonicalize: 后者要求文件已存在, 且会产生 \\?\ 形式的 UNC 路径。
     let config_path = args.config.unwrap_or_else(default_config_path);
+    let config_path = std::path::absolute(&config_path).unwrap_or(config_path);
     info!("加载配置: {}", config_path.display());
 
     let cfg = match config::load(&config_path) {
@@ -91,6 +103,9 @@ fn main() {
                 m.name,
                 m
             );
+            if !m.comment.is_empty() {
+                println!("        {}", m.comment);
+            }
         }
         return;
     }
@@ -111,9 +126,79 @@ fn main() {
         std::process::exit(1);
     }
 
-    info!("=== 运行中, Ctrl+C 退出 ===");
-    hook::run_message_loop();
+    // 文件监听要在托盘之前起来, 这样启动后立刻改配置也不会漏掉。
+    // Debouncer 必须持有到程序结束, drop 掉监听就停了。
+    let main_thread = unsafe { GetCurrentThreadId() };
+    let _watcher = match watcher::spawn(&config_path, main_thread) {
+        Ok(w) => Some(w),
+        Err(e) => {
+            // 监听失败不致命: 大不了退回手动重载
+            warn!("{e}; 配置热重载不可用");
+            None
+        }
+    };
+
+    let mut tray = match tray::Tray::new(&config_path) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("{e}");
+            hook::uninstall();
+            std::process::exit(1);
+        }
+    };
+
+    info!("=== 运行中, 通过托盘菜单退出 ===");
+    run_app_loop(&mut tray, &config_path);
     hook::uninstall();
+}
+
+/// 主消息循环。
+///
+/// 这一个循环同时承担三件事, 这也是不需要额外线程的原因:
+///   1. 派发低级钩子的回调 (系统在本线程的消息处理中调用它们)
+///   2. 派发托盘窗口的消息, 菜单点击由此产生
+///   3. 接收文件监听线程 PostThreadMessage 过来的重载通知
+fn run_app_loop(tray: &mut tray::Tray, config_path: &Path) {
+    let mut msg: MSG = unsafe { std::mem::zeroed() };
+
+    loop {
+        // 返回 0 表示 WM_QUIT, -1 表示出错
+        let ret = unsafe { GetMessageW(&mut msg, ptr::null_mut(), 0, 0) };
+        if ret <= 0 {
+            break;
+        }
+
+        // 文件监听线程发来的重载完成通知。这类消息 hwnd 为空,
+        // 不会被 DispatchMessage 派发给任何窗口, 只能在这里自己认。
+        if msg.message == watcher::WM_CONFIG_RELOADED {
+            tray.refresh();
+            continue;
+        }
+
+        unsafe {
+            let _ = TranslateMessage(&msg);
+            DispatchMessageW(&msg);
+        }
+
+        // 菜单点击是在上面 DispatchMessage 处理托盘窗口消息时投递到 channel 的,
+        // 所以紧接着取一次就能拿到。
+        while let Ok(event) = MenuEvent::receiver().try_recv() {
+            match tray.on_menu(&event.id) {
+                tray::Action::Quit => {
+                    info!("退出");
+                    unsafe { PostQuitMessage(0) };
+                }
+                tray::Action::Reload => match watcher::reload_now(config_path) {
+                    Ok(n) => {
+                        info!("已手动重载配置, {n} 条映射生效");
+                        tray.refresh();
+                    }
+                    Err(e) => error!("{e}"),
+                },
+                tray::Action::Nothing => {}
+            }
+        }
+    }
 }
 
 fn default_config_path() -> PathBuf {

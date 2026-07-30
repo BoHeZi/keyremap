@@ -58,6 +58,31 @@ fn current_config() -> Option<Arc<Config>> {
     CONFIG.get()?.read().ok().map(|g| g.clone())
 }
 
+/// 取当前配置的快照, 供托盘构建菜单。
+pub fn config_snapshot() -> Option<Arc<Config>> {
+    current_config()
+}
+
+/// 切换第 `index` 条映射的启用状态, 返回切换后的值。
+///
+/// 只改内存不写回文件: 写回会触发文件监听再触发重载, 形成回路;
+/// 而且托盘上的开关更像"临时静音", 重载配置时回到文件里写的状态是合理的。
+///
+/// 用 copy-on-write 整体替换 Arc, 而不是原地改 —— 这样钩子回调侧永远
+/// 看到的是一个完整一致的配置, 不需要在热路径上加写锁。
+pub fn toggle_mapping(index: usize) -> Option<bool> {
+    let cell = CONFIG.get()?;
+    let mut guard = cell.write().ok()?;
+
+    let mut next = (**guard).clone();
+    let m = next.mappings.get_mut(index)?;
+    m.enable = !m.enable;
+    let now = m.enable;
+
+    *guard = Arc::new(next);
+    Some(now)
+}
+
 pub fn set_enabled(on: bool) {
     ENABLED.store(on, Ordering::Relaxed);
     info!("映射已{}", if on { "启用" } else { "禁用" });
@@ -147,12 +172,11 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
         // 连 MSLLHOOKSTRUCT 都不去解引用。
         if msg != WM_MOUSEMOVE {
             let ms = unsafe { &*(lparam as *const MSLLHOOKSTRUCT) };
-            if ms.dwExtraInfo != INJECTED_TAG {
-                if let Some((btn, is_down)) = decode_mouse(msg, ms.mouseData) {
-                    if dispatch(Input::Mouse(btn), is_down) {
-                        return 1;
-                    }
-                }
+            if ms.dwExtraInfo != INJECTED_TAG
+                && let Some((btn, is_down)) = decode_mouse(msg, ms.mouseData)
+                && dispatch(Input::Mouse(btn), is_down)
+            {
+                return 1;
             }
         }
     }

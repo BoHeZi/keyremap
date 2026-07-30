@@ -93,10 +93,13 @@ impl Config {
     ///
     /// 没有的话就不安装鼠标钩子 —— `WH_MOUSE_LL` 会收到全部鼠标移动事件,
     /// 鼠标动一下就进一次回调, 这是常态下最大的一笔无谓开销。
+    ///
+    /// 注意这里**不看 enable**: 托盘菜单可以随时把某条鼠标映射打开,
+    /// 若按启用状态决定是否装钩子, 那条映射打开后会不生效。
     pub fn needs_mouse_hook(&self) -> bool {
         self.mappings
             .iter()
-            .any(|m| m.enable && matches!(m.from, Input::Mouse(_)))
+            .any(|m| matches!(m.from, Input::Mouse(_)))
     }
 
     pub fn enabled_count(&self) -> usize {
@@ -227,6 +230,22 @@ to = "A"
         .unwrap_err();
         assert!(err.contains("错误项"), "报错应指明是哪一条: {err}");
         assert!(err.contains("NoSuchKey"), "报错应指明是哪个键名: {err}");
+    }
+
+    #[test]
+    fn 鼠标映射即使被禁用也要装钩子() {
+        // 否则托盘把它打开后会不生效
+        let cfg = parse(
+            r#"
+[[mappings]]
+enable = false
+from = "MouseX1"
+to = "Esc"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.enabled_count(), 0);
+        assert!(cfg.needs_mouse_hook());
     }
 
     #[test]

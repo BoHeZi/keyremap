@@ -15,7 +15,12 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_Shell",          # ShellExecuteW: 打开配置文件/目录
+    "Win32_System_Threading",  # GetCurrentThreadId: 给监听线程回发消息用
 ] }
+# 关掉 default features: gtk / macos_fsevent 都是其他平台专用的
+tray-icon = { version = "0.24", default-features = false }
+notify-debouncer-mini = { version = "0.7", default-features = false }
 
 [profile.release]
 lto = true

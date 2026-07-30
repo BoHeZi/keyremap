@@ -1,0 +1,36 @@
+# keyremap 配置文件
+#
+# 这份文件是首次运行时自动生成的, 里面还没有任何映射 —— 也就是说程序现在
+# 什么都不拦, 按键行为和平时完全一样。加映射有两条路:
+#
+#   * 托盘菜单 -> "Web 配置工具": 在浏览器里可视化编辑, 直接存回本文件
+#   * 直接改本文件, 保存后主程序自动重载 (托盘会弹提示)
+#
+# 想知道某个键叫什么名字: 托盘菜单 -> "按键监听", 或者 keyremap --listen
+# 想看全部可用键名:       keyremap --dump-keys
+
+name = "我的配置"
+
+# 托盘菜单里"Web 配置工具"打开的地址。留空则用仓库自带的 GitHub Pages 部署。
+# 自己部署到别处 (比如 Cloudflare Pages) 时改这里。
+# web_url = "https://my-keyremap.pages.dev/"
+
+# 组开关。这里没列出的组默认启用, 所以只想分组、不想预设开关时
+# 可以把整段删掉。托盘菜单里也能临时切换 (只改内存, 不写回本文件)。
+[groups]
+
+# ---- 映射写法, 去掉注释即可试用 ----
+#
+# [[mappings]]
+# name = "Pause转Insert"
+# comment = "把不常用的 Pause 键变成 Insert"
+# from = "Pause"
+# to = "Insert"
+#
+# 想输出组合键就把 to 写成数组; group 不需要预先声明, 写了就有:
+#
+# [[mappings]]
+# name = "关闭标签页"
+# group = "浏览器"
+# from = "MouseX2"
+# to = ["Ctrl", "W"]

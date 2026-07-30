@@ -18,8 +18,11 @@ use windows_sys::Win32::System::Threading::CreateMutexW;
 ///
 /// Windows 路径不区分大小写, 所以统一转小写再哈希, 免得同一个文件
 /// 因为大小写写法不同被当成两份。
+///
+/// 用 [`crate::paths::stable_exe`] 而不是 `current_exe`: scoop 那种带版本号的
+/// 安装目录会让锁名每次升级都变, 于是"是否已启用自启"的判断跟着失灵。
 pub fn name_for_current_exe() -> String {
-    let path = std::env::current_exe().unwrap_or_default();
+    let path = crate::paths::stable_exe();
     let mut h = DefaultHasher::new();
     path.to_string_lossy().to_lowercase().hash(&mut h);
     format!("keyremap-{:016x}", h.finish())

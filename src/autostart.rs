@@ -18,7 +18,7 @@ use std::process::Command;
 use log::debug;
 use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
 
-use crate::{elevate, regutil, singleton};
+use crate::{elevate, paths, regutil, singleton};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
 const RUN_VALUE: &str = "keyremap";
@@ -98,10 +98,8 @@ fn run_entry_is_self() -> bool {
     let Some(existing) = regutil::read_string(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE) else {
         return false;
     };
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    let prefix = format!("\"{}\"", exe.display()).to_lowercase();
+    // 必须和 launch_command 用同一个路径口径, 否则自己写下的项自己认不出来
+    let prefix = format!("\"{}\"", paths::stable_exe().display()).to_lowercase();
     existing.to_lowercase().starts_with(&prefix)
 }
 
@@ -170,13 +168,20 @@ fn schtasks(args: &[&str]) -> Result<String, String> {
 
 /// 自启时使用的命令行。
 ///
-/// 配置就在 exe 同目录且用默认名时不带 `-c`, 命令行更短也更不容易出错
-/// (schtasks 的 /TR 对嵌套引号比较敏感)。
+/// 两个要点:
+///
+/// - exe 路径走 [`paths::stable_exe`]。这条路径要在注册表或计划任务里存到下次开机,
+///   而 scoop 的版本目录到那时可能已经不存在了。
+/// - 配置正好是默认查找结果时不带 `-c`, 命令行更短也更不容易出错
+///   (schtasks 的 /TR 对嵌套引号比较敏感)。省掉 `-c` 之后启动的实例会自己
+///   重跑一遍查找, 结果和现在一致。
 fn launch_command(config_path: &Path) -> Result<String, String> {
-    let exe = std::env::current_exe().map_err(|e| format!("无法确定程序路径: {e}"))?;
-    let default = exe.parent().map(|d| d.join("keyremap.toml"));
+    let exe = paths::stable_exe();
+    if exe.as_os_str().is_empty() {
+        return Err("无法确定程序路径".into());
+    }
 
-    Ok(if default.as_deref() == Some(config_path) {
+    Ok(if paths::default_config().as_path() == config_path {
         format!("\"{}\"", exe.display())
     } else {
         format!("\"{}\" -c \"{}\"", exe.display(), config_path.display())
@@ -190,10 +195,7 @@ mod tests {
 
     #[test]
     fn 默认配置路径不带参数() {
-        // 只能间接验证: 默认名与非默认名产生的命令长度不同
-        let exe = std::env::current_exe().unwrap();
-        let default = exe.parent().unwrap().join("keyremap.toml");
-        let cmd = launch_command(&default).unwrap();
+        let cmd = launch_command(&paths::default_config()).unwrap();
         assert!(!cmd.contains("-c"), "默认路径不该带 -c: {cmd}");
         assert!(cmd.starts_with('"') && cmd.ends_with('"'));
     }

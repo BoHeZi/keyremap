@@ -15,6 +15,7 @@ mod elevate;
 mod hook;
 mod inject;
 mod keycode;
+mod paths;
 mod regutil;
 mod singleton;
 mod tray;
@@ -36,7 +37,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 #[derive(Parser, Debug)]
 #[command(author, version, about = "Windows 键盘/鼠标重映射工具", long_about = None)]
 struct Args {
-    /// 配置文件路径, 默认为可执行文件同目录下的 keyremap.toml
+    /// 配置文件路径。默认先看 exe 同目录的 keyremap.toml (绿色版),
+    /// 没有则用 %APPDATA%\keyremap\keyremap.toml (首次运行自动生成)
     #[arg(short, long)]
     config: Option<PathBuf>,
 
@@ -116,8 +118,20 @@ fn main() {
     // 规范成绝对路径。相对路径的 parent() 是空串而不是 None,
     // 会让文件监听拿不到可用的目录, 热重载直接失效。
     // 用 absolute 而非 canonicalize: 后者要求文件已存在, 且会产生 \\?\ 形式的 UNC 路径。
-    let config_path = args.config.unwrap_or_else(default_config_path);
+    let explicit = args.config.is_some();
+    let config_path = args.config.unwrap_or_else(paths::default_config);
     let config_path = std::path::absolute(&config_path).unwrap_or(config_path);
+
+    // 首次运行时把模板写出来, 否则 scoop 这类安装方式下装完一启动就是错误框。
+    // 只对默认路径这么做: `-c` 指定的路径若不存在, 更可能是文件名敲错了,
+    // 悄悄建一个空配置远不如直接报错有用。
+    if !explicit {
+        match paths::ensure_config(&config_path) {
+            Ok(true) => info!("已生成默认配置: {}", config_path.display()),
+            Ok(false) => {}
+            Err(e) => warn!("{e}"),
+        }
+    }
     info!("加载配置: {}", config_path.display());
 
     let cfg = match config::load(&config_path) {
@@ -134,7 +148,7 @@ fn main() {
     config::warn_conflicts(&cfg);
 
     if args.dump {
-        emit(&dump_text(&cfg), args.output.as_deref());
+        emit(&dump_text(&cfg, &config_path), args.output.as_deref());
         return;
     }
 
@@ -226,8 +240,12 @@ fn main() {
 ///
 /// 状态列反映的是**实际是否生效**而不只是映射自身的开关: 一条自身启用、
 /// 但所属组被关掉的映射并不工作, 标成 on 会造成误导。
-fn dump_text(cfg: &config::Config) -> String {
-    let mut text = format!("配置名称: {}\n", cfg.name);
+fn dump_text(cfg: &config::Config, config_path: &std::path::Path) -> String {
+    // 这两行是排查问题的起点: 配置有好几个可能的位置, 而自启记下的程序路径
+    // 和当前 exe 未必是同一条 (scoop 会走 current 联接)。
+    let mut text = format!("配置文件: {}\n", config_path.display());
+    text.push_str(&format!("程序路径: {}\n", paths::stable_exe().display()));
+    text.push_str(&format!("配置名称: {}\n", cfg.name));
     text.push_str(&format!(
         "生效 {}/{} 条\n",
         cfg.active_count(),
@@ -359,13 +377,6 @@ fn tray_reload_text() -> String {
         .map(|c| c.active_count())
         .unwrap_or(0);
     format!("{n} 条映射生效")
-}
-
-fn default_config_path() -> PathBuf {
-    std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(|d| d.join("keyremap.toml")))
-        .unwrap_or_else(|| PathBuf::from("keyremap.toml"))
 }
 
 /// 键名表 JSON, 供 Web 配置工具作为唯一事实来源。

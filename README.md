@@ -2,7 +2,7 @@
 
 Windows 平台的键盘 / 鼠标按键重映射工具。TOML 声明式配置，托盘常驻，改完配置自动生效。
 
-单文件绿色运行，无需安装，无需运行时依赖，release 体积约 900 KB。
+单文件运行，无运行时依赖，release 体积约 1 MB。可以 scoop 安装，也可以解压即用。
 
 ## 这个工具适合谁
 
@@ -20,11 +20,24 @@ Windows 平台的键盘 / 鼠标按键重映射工具。TOML 声明式配置，�
 
 另一个不那么显眼但真实的理由：键盘钩子在技术上等同于键盘记录器。本项目全部实现约 1200 行，可以逐行读完，而 AutoHotkey 是几十万行 C++。在公司电脑或安全敏感环境里，这有时是决定性的。
 
-## 快速开始
+## 安装
 
-1. 下载 release 里的 `keyremap.exe` 与 `keyremap.toml`，放在同一目录
+### scoop
+
+```
+scoop bucket add huanfeng https://github.com/huanfeng/scoop-bucket
+scoop install keyremap
+```
+
+装完直接运行 `keyremap` 即可。配置会自动生成在 `%APPDATA%\keyremap\keyremap.toml`，升级不会动它。
+
+### 绿色版
+
+1. 下载 release 里的压缩包，解压到任意目录（`keyremap.exe` 与 `keyremap.toml` 需在同一目录）
 2. 按需编辑 `keyremap.toml`
 3. 双击运行 —— 没有控制台窗口，托盘出现图标即已生效
+
+## 快速开始
 
 不确定某个键叫什么名字，用**托盘菜单 → 按键监听**打开一个监听窗口，按下它看输出。命令行等价形式：
 
@@ -38,7 +51,21 @@ keyremap.exe --listen
 
 ## 配置
 
-配置文件默认是 exe 同目录下的 `keyremap.toml`，也可以用 `-c` 指定。
+### 配置文件在哪
+
+按下面的顺序查找，用第一个命中的：
+
+| 顺序 | 位置 | 用于 |
+|---|---|---|
+| 1 | `-c <路径>` 指定的文件 | 手动指定 |
+| 2 | exe 同目录的 `keyremap.toml` | **绿色版**，整个目录拷走就带走配置 |
+| 3 | `%APPDATA%\keyremap\keyremap.toml` | **安装版**，首次运行自动生成 |
+
+不确定当前用的是哪个，跑 `keyremap --dump` 看第一行。
+
+scoop 安装时第 2 条会被**跳过**：压缩包里自带的 `keyremap.toml` 会被解压进 `apps\keyremap\<版本>\`，而那个目录每次升级都会被换掉。把配置放在那里，用户改完下次升级就静默丢了。所以 scoop 装的一律走第 3 条，安装目录里那份只作示例（程序会在日志里说明这一点）。
+
+同理，开机自启记下的程序路径走 `apps\keyremap\current\`（scoop 指向当前版本的联接）而不是带版本号的真实路径，否则升级之后自启会指向一个已被删除的目录。
 
 **保存即生效** —— 程序监听配置文件变化，保存后自动重载并弹出气泡提示。配置写错也不要紧：解析失败时会保留上一份配置继续运行，不会让映射整体失效。
 
@@ -235,7 +262,7 @@ Windows 的 UIPI 机制禁止低权限进程向高权限进程注入输入 —�
 
 | 参数 | 说明 |
 |---|---|
-| `-c, --config <PATH>` | 指定配置文件，默认为 exe 同目录的 `keyremap.toml` |
+| `-c, --config <PATH>` | 指定配置文件，默认见[配置文件在哪](#配置文件在哪) |
 | `-l, --listen` | 监听模式，只打印按下的键名，不做任何映射 |
 | `--dump` | 按组打印已加载的映射后退出 |
 | `--dump-keys` | 输出全部可用键名（JSON）后退出 |
@@ -270,6 +297,28 @@ python assets\make-icons.py    # 图标源变了：从 app_icon.ico 派生其余
 ```
 
 改了 `Cargo.toml` 的版本号，要同步改 `assets/app.rc` 里的三处版本字段再重新生成。CI 会比对 exe 的版本资源与 `Cargo.toml`，忘记时构建会失败。
+
+## 发布
+
+版本号有三处，发版前必须先在本地对齐：
+
+1. `Cargo.toml` 的 `version`
+2. `assets/app.rc` 的 `FILEVERSION` / `FileVersion` / `ProductVersion`
+3. 跑 `.\assets\build-res.ps1` 重新生成 `assets/app.res`，提交
+
+然后打 tag 推送：
+
+```
+git tag v0.2.0 && git push origin v0.2.0
+```
+
+`release.yml` 会校验 tag、`Cargo.toml`、exe 版本资源三者一致——不一致就直接失败，而不是发一个自相矛盾的包（流水线改不了预编译的 `app.res`，所以只能校验不能自动修）。
+
+通过之后自动：构建 → 打包 `keyremap-<版本>-windows-x86_64.zip` → 建 Release → 向 [huanfeng/scoop-bucket](https://github.com/huanfeng/scoop-bucket) 发 `repository_dispatch`，由对端下载资产、算 sha256、更新清单。
+
+压缩包内**不套目录**，文件都在根。scoop 直接解压到应用目录，多一层壳就得靠清单里的 `extract_dir`，而那个值带版本号，自动更新的清单维护不了。
+
+需要在本仓库配置 secret `SCOOP_BUCKET_GITHUB_TOKEN`（对 scoop-bucket 仓库有 `contents:write` 的 PAT）。
 
 ## 实现说明
 

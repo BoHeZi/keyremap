@@ -17,7 +17,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use log::{debug, error, info, warn};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -28,12 +28,14 @@ use windows_sys::Win32::UI::Shell::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetCursorPos, IDI_APPLICATION, LoadIconW, MF_CHECKED, MF_SEPARATOR, MF_STRING, PostQuitMessage,
-    RegisterClassW, SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    GetCursorPos, GetSystemMetrics, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR,
+    LoadIconW, LoadImageW, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
+    MF_STRING, MessageBoxW, PostQuitMessage, RegisterClassW, SM_CXSMICON, SM_CYSMICON,
+    SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
+    WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
 };
 
-use crate::{hook, watcher};
+use crate::{autostart, elevate, hook, watcher};
 
 /// 托盘图标回调消息。图标上的鼠标动作都通过它送到窗口过程。
 const WM_TRAY_CALLBACK: u32 = WM_APP + 100;
@@ -48,7 +50,21 @@ const ID_RELOAD: u32 = 2;
 const ID_OPEN_FILE: u32 = 3;
 const ID_OPEN_DIR: u32 = 4;
 const ID_QUIT: u32 = 5;
+const ID_LISTEN: u32 = 6;
+const ID_AUTOSTART: u32 = 7;
+const ID_RUNAS: u32 = 8;
 const ID_MAPPING_BASE: u32 = 100;
+
+/// 退出时是否要以管理员身份重启。
+///
+/// 提权不能原地进行, 必须重启进程。而新实例会被旧实例的单实例锁挡住,
+/// 所以这里只置个标记, 由 main 在退出消息循环、释放锁之后再执行。
+static RESTART_AS_ADMIN: AtomicBool = AtomicBool::new(false);
+
+/// 取出并清除"提权重启"请求。
+pub fn take_restart_request() -> bool {
+    RESTART_AS_ADMIN.swap(false, Ordering::SeqCst)
+}
 
 /// 隐藏窗口的句柄。窗口过程与主线程都在同一个线程上跑, 这里只是为了让
 /// 静态变量满足 Sync —— HWND 本身不是 Send。
@@ -204,38 +220,21 @@ unsafe fn show_menu(hwnd: HWND) {
     }
 
     unsafe {
-        let checked = |on: bool| {
-            if on {
-                MF_STRING | MF_CHECKED
-            } else {
-                MF_STRING
-            }
-        };
-
         let label = wide("启用映射");
         AppendMenuW(
             menu,
-            checked(hook::is_enabled()),
+            item_flags(hook::is_enabled()),
             ID_TOGGLE as usize,
             label.as_ptr(),
         );
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
 
-        // 逐条映射的开关。标题里带上映射内容, 一眼能看出哪条是哪条。
-        if let Some(cfg) = hook::config_snapshot() {
-            for (i, m) in cfg.mappings.iter().enumerate() {
-                let w = wide(&m.label());
-                AppendMenuW(
-                    menu,
-                    checked(m.enable),
-                    (ID_MAPPING_BASE + i as u32) as usize,
-                    w.as_ptr(),
-                );
-            }
-            if !cfg.mappings.is_empty() {
-                AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
-            }
-        }
+        // 映射开关收进子菜单
+        append_mapping_submenu(menu);
+
+        let listen = wide("按键监听...");
+        AppendMenuW(menu, MF_STRING, ID_LISTEN as usize, listen.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
 
         for (id, text) in [
             (ID_RELOAD, "重新加载配置"),
@@ -245,6 +244,25 @@ unsafe fn show_menu(hwnd: HWND) {
             let w = wide(text);
             AppendMenuW(menu, MF_STRING, id as usize, w.as_ptr());
         }
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+
+        let autorun = wide("开机自启动");
+        AppendMenuW(
+            menu,
+            item_flags(autostart::is_enabled()),
+            ID_AUTOSTART as usize,
+            autorun.as_ptr(),
+        );
+
+        // 已经是管理员时没什么可做的, 显示成灰色状态项
+        if elevate::is_elevated() {
+            let t = wide("已以管理员身份运行");
+            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, t.as_ptr());
+        } else {
+            let t = wide("以管理员身份重启");
+            AppendMenuW(menu, MF_STRING, ID_RUNAS as usize, t.as_ptr());
+        }
+
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         let quit = wide("退出");
         AppendMenuW(menu, MF_STRING, ID_QUIT as usize, quit.as_ptr());
@@ -270,6 +288,122 @@ unsafe fn show_menu(hwnd: HWND) {
         if cmd > 0 {
             handle_command(cmd as u32);
         }
+    }
+}
+
+/// 菜单项的标志位: 勾选与否。
+fn item_flags(checked: bool) -> u32 {
+    if checked {
+        MF_STRING | MF_CHECKED
+    } else {
+        MF_STRING
+    }
+}
+
+/// 把逐条映射的开关挂成子菜单。
+///
+/// 映射条数是随配置增长的, 全摊在一级菜单里会让菜单越来越长, 而且"退出"这类
+/// 常用项的位置会随配置数量上下漂移。收进子菜单后一级菜单的结构就固定了。
+unsafe fn append_mapping_submenu(parent: HMENU) {
+    let cfg = hook::config_snapshot();
+    let mappings = cfg.as_ref().map(|c| c.mappings.as_slice()).unwrap_or(&[]);
+
+    if mappings.is_empty() {
+        let text = wide("映射开关 (无配置)");
+        unsafe { AppendMenuW(parent, MF_STRING | MF_GRAYED, 0, text.as_ptr()) };
+        return;
+    }
+
+    let sub = unsafe { CreatePopupMenu() };
+    if sub.is_null() {
+        warn!("创建子菜单失败");
+        return;
+    }
+
+    unsafe {
+        for (i, m) in mappings.iter().enumerate() {
+            let w = wide(&m.label());
+            AppendMenuW(
+                sub,
+                item_flags(m.enable),
+                (ID_MAPPING_BASE + i as u32) as usize,
+                w.as_ptr(),
+            );
+        }
+
+        let on = mappings.iter().filter(|m| m.enable).count();
+        let title = wide(&format!("映射开关 ({on}/{})", mappings.len()));
+        // MF_POPUP 时第三个参数是子菜单句柄而非命令 ID。
+        // 父菜单 DestroyMenu 时会连带销毁子菜单, 不用单独释放。
+        AppendMenuW(parent, MF_POPUP | MF_STRING, sub as usize, title.as_ptr());
+    }
+}
+
+/// 另起一个进程跑监听模式。
+///
+/// 监听模式不受单实例限制, 所以可以和正在运行的实例并存。传 --new-console
+/// 是为了让它自己开一个终端窗口, 而不是附到本进程可能存在的控制台上。
+fn spawn_listen() {
+    let exe = match std::env::current_exe() {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("无法定位自身路径: {e}");
+            return;
+        }
+    };
+    let file = wide_os(exe.as_os_str());
+    let params = wide("--listen --new-console");
+    let verb = wide("open");
+    unsafe {
+        ShellExecuteW(
+            ptr::null_mut(),
+            verb.as_ptr(),
+            file.as_ptr(),
+            params.as_ptr(),
+            ptr::null(),
+            SW_SHOWNORMAL,
+        );
+    }
+    info!("已启动按键监听窗口");
+}
+
+fn toggle_autostart() {
+    let turn_on = !autostart::is_enabled();
+    let result = match CONFIG_PATH.get() {
+        Some(path) if turn_on => autostart::enable(path),
+        Some(_) => autostart::disable(),
+        None => Err("配置路径未知".to_string()),
+    };
+
+    match result {
+        Ok(()) => {
+            let msg = if turn_on {
+                "已设置为开机自启动"
+            } else {
+                "已取消开机自启动"
+            };
+            info!("{msg}");
+            notify("keyremap-ng", msg);
+        }
+        Err(e) => {
+            error!("设置自启动失败: {e}");
+            notify("设置自启动失败", &e);
+        }
+    }
+}
+
+/// 托盘还没建立起来时报错用。GUI 子系统下没有控制台, 错误信息会彻底消失,
+/// 所以用消息框兜底 —— 启动失败必须让用户看得见。
+pub fn show_error(title: &str, message: &str) {
+    let t = wide(title);
+    let m = wide(message);
+    unsafe {
+        MessageBoxW(
+            ptr::null_mut(),
+            m.as_ptr(),
+            t.as_ptr(),
+            MB_ICONERROR | MB_OK,
+        );
     }
 }
 
@@ -313,6 +447,13 @@ fn handle_command(id: u32) {
                 open_path(dir);
             }
         }
+        ID_LISTEN => spawn_listen(),
+        ID_AUTOSTART => toggle_autostart(),
+        ID_RUNAS => {
+            // 只置标记, 真正的重启在 main 里做 —— 那时单实例锁已经释放
+            RESTART_AS_ADMIN.store(true, Ordering::SeqCst);
+            unsafe { PostQuitMessage(0) };
+        }
         ID_QUIT => {
             info!("退出");
             unsafe { PostQuitMessage(0) };
@@ -342,19 +483,29 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
     data
 }
 
-/// 从 exe 内嵌资源加载图标 (资源名 "id" 定义在 assets/app.rc)。
-/// 取不到就退回系统默认图标, 保证托盘一定有东西显示。
-fn load_app_icon() -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+/// 从 exe 内嵌资源加载托盘图标 (资源名 "id" 定义在 assets/app.rc)。
+///
+/// 关键是用 `LoadImageW` 并显式指定**小图标**尺寸, 而不是 `LoadIconW` ——
+/// 后者总是加载大图标 (SM_CXICON, 通常 32x32), 托盘再缩到 16x16 显示,
+/// 结果就是发虚。指定尺寸后系统会从 ICO 里挑最接近的那一张
+/// (本项目的图标含 16/24/32/48 四种), 无需缩放。
+///
+/// 尺寸取自 `SM_CXSMICON`, 它在声明了 DPI 感知后会返回按当前缩放换算的真实像素,
+/// 所以高 DPI 屏上也能拿到清晰的图标。
+fn load_app_icon() -> HICON {
     unsafe {
         let hinst = GetModuleHandleW(ptr::null());
         let name = wide("id");
-        let icon = LoadIconW(hinst, name.as_ptr());
-        if icon.is_null() {
-            warn!("加载内嵌图标失败, 使用系统默认图标");
-            LoadIconW(ptr::null_mut(), IDI_APPLICATION)
-        } else {
-            icon
+        let cx = GetSystemMetrics(SM_CXSMICON);
+        let cy = GetSystemMetrics(SM_CYSMICON);
+
+        let icon = LoadImageW(hinst, name.as_ptr(), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
+        if !icon.is_null() {
+            return icon as HICON;
         }
+
+        warn!("加载内嵌图标失败, 使用系统默认图标");
+        LoadIconW(ptr::null_mut(), IDI_APPLICATION)
     }
 }
 

@@ -64,6 +64,15 @@ impl Mapping {
     pub fn is_combo(&self) -> bool {
         self.to.len() > 1
     }
+
+    /// 菜单项与日志里显示的标题。没写 name 时退回映射本身的描述。
+    pub fn label(&self) -> String {
+        if self.name.is_empty() {
+            self.to_string()
+        } else {
+            format!("{}  ({})", self.name, self)
+        }
+    }
 }
 
 impl fmt::Display for Mapping {

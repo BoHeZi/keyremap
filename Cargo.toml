@@ -15,13 +15,14 @@ windows-sys = { version = "0.61", features = [
     "Win32_Foundation",
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
-    "Win32_UI_Shell",          # ShellExecuteW: 打开配置文件/目录
+    "Win32_UI_Shell",          # Shell_NotifyIconW 托盘图标 / ShellExecuteW
+    "Win32_System_LibraryLoader", # GetModuleHandleW: 注册窗口类与加载图标资源
+    "Win32_Graphics_Gdi",      # WNDCLASSW 里的 HBRUSH 等字段类型
     "Win32_System_Threading",  # CreateMutexW / GetCurrentThreadId
     "Win32_System_Console",    # FreeConsole: 后台运行时收起控制台
     "Win32_Security",          # CreateMutexW 的 SECURITY_ATTRIBUTES 参数类型
 ] }
-# 关掉 default features: gtk / macos_fsevent 都是其他平台专用的
-tray-icon = { version = "0.24", default-features = false }
+# 关掉 default features: macos_fsevent 是其他平台专用的
 notify-debouncer-mini = { version = "0.7", default-features = false }
 
 [profile.release]

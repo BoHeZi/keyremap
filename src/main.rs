@@ -14,16 +14,15 @@ mod singleton;
 mod tray;
 mod watcher;
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::ptr;
 
 use clap::Parser;
 use log::{LevelFilter, error, info, warn};
-use tray_icon::menu::MenuEvent;
 use windows_sys::Win32::System::Console::FreeConsole;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage,
+    DispatchMessageW, GetMessageW, MSG, TranslateMessage,
 };
 
 #[derive(Parser, Debug)]
@@ -169,14 +168,11 @@ fn main() {
         }
     };
 
-    let mut tray = match tray::Tray::new(&config_path) {
-        Ok(t) => t,
-        Err(e) => {
-            error!("{e}");
-            hook::uninstall();
-            std::process::exit(1);
-        }
-    };
+    if let Err(e) = tray::init(&config_path) {
+        error!("{e}");
+        hook::uninstall();
+        std::process::exit(1);
+    }
 
     info!("=== 运行中, 通过托盘菜单退出 ===");
 
@@ -189,7 +185,8 @@ fn main() {
         unsafe { FreeConsole() };
     }
 
-    run_app_loop(&mut tray, &config_path);
+    run_app_loop();
+    tray::shutdown();
     hook::uninstall();
 }
 
@@ -203,9 +200,9 @@ fn log_file_path() -> Option<PathBuf> {
 ///
 /// 这一个循环同时承担三件事, 这也是不需要额外线程的原因:
 ///   1. 派发低级钩子的回调 (系统在本线程的消息处理中调用它们)
-///   2. 派发托盘窗口的消息, 菜单点击由此产生
+///   2. 派发托盘窗口的消息, 右键菜单与菜单命令都在窗口过程里直接处理完
 ///   3. 接收文件监听线程 PostThreadMessage 过来的重载通知
-fn run_app_loop(tray: &mut tray::Tray, config_path: &Path) {
+fn run_app_loop() {
     let mut msg: MSG = unsafe { std::mem::zeroed() };
 
     loop {
@@ -218,7 +215,8 @@ fn run_app_loop(tray: &mut tray::Tray, config_path: &Path) {
         // 文件监听线程发来的重载完成通知。这类消息 hwnd 为空,
         // 不会被 DispatchMessage 派发给任何窗口, 只能在这里自己认。
         if msg.message == watcher::WM_CONFIG_RELOADED {
-            tray.refresh();
+            tray::update_status();
+            tray::notify("配置已重载", &tray_reload_text());
             continue;
         }
 
@@ -226,26 +224,14 @@ fn run_app_loop(tray: &mut tray::Tray, config_path: &Path) {
             let _ = TranslateMessage(&msg);
             DispatchMessageW(&msg);
         }
-
-        // 菜单点击是在上面 DispatchMessage 处理托盘窗口消息时投递到 channel 的,
-        // 所以紧接着取一次就能拿到。
-        while let Ok(event) = MenuEvent::receiver().try_recv() {
-            match tray.on_menu(&event.id) {
-                tray::Action::Quit => {
-                    info!("退出");
-                    unsafe { PostQuitMessage(0) };
-                }
-                tray::Action::Reload => match watcher::reload_now(config_path) {
-                    Ok(n) => {
-                        info!("已手动重载配置, {n} 条映射生效");
-                        tray.refresh();
-                    }
-                    Err(e) => error!("{e}"),
-                },
-                tray::Action::Nothing => {}
-            }
-        }
     }
+}
+
+fn tray_reload_text() -> String {
+    let n = hook::config_snapshot()
+        .map(|c| c.enabled_count())
+        .unwrap_or(0);
+    format!("{n} 条映射生效")
 }
 
 fn default_config_path() -> PathBuf {

@@ -17,6 +17,19 @@
     <button @click="openFile()" x-text="restoreName ? `继续编辑 ${restoreName}` : '打开配置文件'"></button>
     <button class="ghost" @click="newConfig()">从空白开始</button>
     <span class="badge" x-text="mode"></span>
+    <!-- 图标内联而不是引外部文件: 本页要能离线、也能直接用 file:// 打开 -->
+    <a class="gh" href="https://github.com/huanfeng/keyremap" target="_blank" rel="noopener">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path fill="currentColor"
+        d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38
+           0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13
+           -.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66
+           .07-.52.28-.87.51-1.07-1.78-.2-2.64-.89-2.64-2.42 0-.68.24-1.24.64-1.68
+           -.06-.16-.28-.79.06-1.64 0 0 .48-.15 1.58.59a5.6 5.6 0 0 1 1.5-.2c.51 0 1.02.07 1.5.2
+           1.1-.75 1.58-.59 1.58-.59.34.85.12 1.48.06 1.64.4.44.64 1 .64 1.68
+           0 1.54-.87 2.22-2.65 2.42.28.24.52.71.52 1.44 0 1.04-.01 1.88-.01 2.14
+           0 .21.15.46.55.38A7.99 7.99 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+      GitHub
+    </a>
   </div>
 </header>
 
@@ -153,6 +166,17 @@
   <p>
     保存后主程序会自动重载并弹出提示，不需要重启。
     键名表由 <code>keyremap --dump-keys</code> 生成，与主程序同源。
+  </p>
+  <p class="links">
+    <a href="https://github.com/huanfeng/keyremap" target="_blank" rel="noopener">项目主页</a>
+    <a href="https://github.com/huanfeng/keyremap#readme" target="_blank" rel="noopener">使用说明</a>
+    <a href="https://github.com/huanfeng/keyremap/releases" target="_blank" rel="noopener">下载与更新</a>
+    <a href="https://github.com/huanfeng/keyremap/issues" target="_blank" rel="noopener">反馈问题</a>
+    <a href="https://github.com/huanfeng/keyremap/blob/main/LICENSE" target="_blank" rel="noopener">MIT License</a>
+  </p>
+  <p>
+    本页是 keyremap 的配置工具，纯静态页面、没有后端。配置内容只在你的浏览器和本机文件之间往来，
+    <strong>不会上传到任何服务器</strong>；主程序本身也不含任何网络功能。
   </p>
 </footer>
 

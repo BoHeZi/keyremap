@@ -185,6 +185,34 @@ footer {
   color: var(--muted);
   font-size: .85rem;
 }
+footer p { margin: .4rem 0; }
+
+a { color: var(--accent); }
+a:hover { text-decoration: none; }
+
+/* 页脚链接行。用 gap 而不是分隔符字符, 换行时不会留下孤零零的竖线 */
+.links {
+  display: flex;
+  flex-wrap: wrap;
+  gap: .35rem 1.1rem;
+}
+
+/* 顶栏的 GitHub 入口。做成和 .ghost 按钮相仿的低调样式, 免得和主操作抢注意力 */
+.gh {
+  display: inline-flex;
+  align-items: center;
+  gap: .35rem;
+  padding: .35rem .7rem;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  color: var(--muted);
+  text-decoration: none;
+  font-size: .85rem;
+}
+.gh:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
 code { font-family: var(--mono); font-size: .92em; }
 
 /* ---- 捕获浮层 ---- */

@@ -201,6 +201,15 @@ web_url = "https://my-keyremap.pages.dev/"
 
 一级菜单的项目是固定的，不随映射条数变化 —— 这样"退出"这类常用项的位置不会漂移。
 
+### 托盘图标的状态
+
+图标会跟着两件事变：
+
+- **启用 / 禁用** —— 禁用时图标变淡
+- **任务栏主题** —— 深色任务栏用浅色图标，浅色任务栏用深色图标
+
+后一条是必需的：图标是单色线条，纯黑的放在深色任务栏上几乎看不见，而 Windows 11 默认就是深色任务栏。系统主题切换时图标会自动跟着换，不用重启。
+
 ## 命令行参数
 
 程序是 GUI 子系统的，双击不会有黑窗口；需要输出时会自动附加控制台 —— 从终端运行就附到当前终端，双击运行则新开一个窗口。
@@ -234,6 +243,15 @@ cargo build --release
 ```
 
 需要 Rust 1.85+（edition 2024）。产物在 `target/release/keyremap-ng.exe`。
+
+**不需要资源编译器** —— `assets/app.res`（四个图标变体 + 文件版本信息）是预编译好提交进仓库的，克隆下来直接 `cargo build` 即可。只有改动图标或版本号时才需要重新生成：
+
+```powershell
+python assets\make-icons.py    # 图标源变了：从 app_icon.ico 派生其余三个变体
+.\assets\build-res.ps1         # 重新编译 app.res（用 rc.exe 或 windres）
+```
+
+改了 `Cargo.toml` 的版本号，要同步改 `assets/app.rc` 里的三处版本字段再重新生成。CI 会比对 exe 的版本资源与 `Cargo.toml`，忘记时构建会失败。
 
 ## 实现说明
 

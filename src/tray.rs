@@ -20,19 +20,22 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
 
 use log::{debug, error, info, warn};
-use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM};
+use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, WPARAM};
 use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+use windows_sys::Win32::System::Registry::{
+    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW, RegQueryValueExW,
+};
 use windows_sys::Win32::UI::Shell::{
     NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_TIP, NIIF_INFO, NIM_ADD, NIM_DELETE, NIM_MODIFY,
     NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    GetCursorPos, GetSystemMetrics, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR,
-    LoadIconW, LoadImageW, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR,
-    MF_STRING, MessageBoxW, PostQuitMessage, RegisterClassW, SM_CXSMICON, SM_CYSMICON,
-    SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
-    WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW,
+    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
+    DestroyWindow, GetCursorPos, GetSystemMetrics, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON,
+    LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP,
+    MF_SEPARATOR, MF_STRING, MessageBoxW, PostQuitMessage, RegisterClassW, SM_CXSMICON,
+    SM_CYSMICON, SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
+    TrackPopupMenu, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW,
 };
 
 use crate::{autostart, config, elevate, hook, watcher};
@@ -42,6 +45,16 @@ const WM_TRAY_CALLBACK: u32 = WM_APP + 100;
 
 /// 托盘图标在本窗口内的唯一编号。只有一个图标, 固定即可。
 const TRAY_ICON_ID: u32 = 1;
+
+// 资源里的图标 ID, 对应 assets/app.rc。
+// dark = 深色线条 (配浅色任务栏), light = 浅色线条 (配深色任务栏)。
+const ICON_DARK_ON: u16 = 1;
+const ICON_DARK_OFF: u16 = 2;
+const ICON_LIGHT_ON: u16 = 3;
+const ICON_LIGHT_OFF: u16 = 4;
+
+/// 当前正在用的 HICON, 换图标时用来释放上一个。
+static CURRENT_ICON: AtomicIsize = AtomicIsize::new(0);
 
 // 菜单命令 ID。映射项从 ID_MAPPING_BASE 开始按下标顺延,
 // 这样不用保存任何 id 表, 反解一次减法就够。
@@ -117,10 +130,10 @@ pub fn init(config_path: &Path) -> Result<(), String> {
         TRAY_HWND.store(hwnd as isize, Ordering::SeqCst);
 
         let mut data = icon_data(hwnd);
-        data.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        data.uFlags = NIF_MESSAGE | NIF_TIP;
         data.uCallbackMessage = WM_TRAY_CALLBACK;
-        data.hIcon = load_app_icon();
         fill_wide(&mut data.szTip, &status_text());
+        apply_icon(&mut data); // 会补上 NIF_ICON
 
         if Shell_NotifyIconW(NIM_ADD, &data) == 0 {
             DestroyWindow(hwnd);
@@ -141,6 +154,11 @@ pub fn shutdown() {
         let data = icon_data(hwnd as HWND);
         Shell_NotifyIconW(NIM_DELETE, &data);
         DestroyWindow(hwnd as HWND);
+
+        let icon = CURRENT_ICON.swap(0, Ordering::SeqCst);
+        if icon != 0 {
+            DestroyIcon(icon as HICON);
+        }
     }
     debug!("托盘图标已移除");
 }
@@ -155,6 +173,8 @@ pub fn update_status() {
         let mut data = icon_data(hwnd as HWND);
         data.uFlags = NIF_TIP;
         fill_wide(&mut data.szTip, &status_text());
+        // 启用状态变了图标也要跟着变 (启用/禁用是两个不同的图标)
+        apply_icon(&mut data);
         Shell_NotifyIconW(NIM_MODIFY, &data);
     }
 }
@@ -204,6 +224,13 @@ unsafe extern "system" fn wnd_proc(
             if action == WM_RBUTTONUP || action == WM_LBUTTONUP {
                 unsafe { show_menu(hwnd) };
             }
+            0
+        }
+        // 系统主题切换时会广播这条消息 (lParam 指向 "ImmersiveColorSet")。
+        // 不去比对那个字符串: 换一次图标很便宜, 而这条消息本身并不频繁;
+        // 反过来若比对错了, 图标就会卡在旧主题的配色上不再更新。
+        WM_SETTINGCHANGE => {
+            update_status();
             0
         }
         WM_DESTROY => {
@@ -565,29 +592,96 @@ fn icon_data(hwnd: HWND) -> NOTIFYICONDATAW {
     data
 }
 
-/// 从 exe 内嵌资源加载托盘图标 (资源名 "id" 定义在 assets/app.rc)。
+/// 任务栏是否为浅色主题。
+///
+/// 图标是单色线条, 用错颜色会在任务栏上几乎看不见 —— 纯黑图标配深色任务栏
+/// 就是这种情况, 而 Windows 11 默认就是深色任务栏。
+///
+/// 注意读的是 `SystemUsesLightTheme` 而不是 `AppsUseLightTheme`:
+/// 前者管的是任务栏与系统 UI, 后者管应用窗口内部, 两者可以不一致。
+/// 读不到时按深色处理 —— 那是新系统的默认值。
+fn taskbar_is_light() -> bool {
+    let sub = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let name = wide("SystemUsesLightTheme");
+    let mut key: HKEY = ptr::null_mut();
+
+    unsafe {
+        if RegOpenKeyExW(
+            HKEY_CURRENT_USER,
+            sub.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        ) != ERROR_SUCCESS
+        {
+            return false;
+        }
+        let mut value: u32 = 0;
+        let mut size = size_of::<u32>() as u32;
+        let rc = RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            ptr::null(),
+            ptr::null_mut(),
+            &mut value as *mut u32 as *mut u8,
+            &mut size,
+        );
+        RegCloseKey(key);
+        rc == ERROR_SUCCESS && value == 1
+    }
+}
+
+/// 按"任务栏主题 × 启用状态"挑图标。四个变体的生成见 assets/make-icons.py。
+fn pick_icon_id() -> u16 {
+    let on = hook::is_enabled();
+    if taskbar_is_light() {
+        if on { ICON_DARK_ON } else { ICON_DARK_OFF }
+    } else if on {
+        ICON_LIGHT_ON
+    } else {
+        ICON_LIGHT_OFF
+    }
+}
+
+/// 从 exe 内嵌资源加载托盘图标。
 ///
 /// 关键是用 `LoadImageW` 并显式指定**小图标**尺寸, 而不是 `LoadIconW` ——
 /// 后者总是加载大图标 (SM_CXICON, 通常 32x32), 托盘再缩到 16x16 显示,
 /// 结果就是发虚。指定尺寸后系统会从 ICO 里挑最接近的那一张
-/// (本项目的图标含 16/24/32/48 四种), 无需缩放。
+/// (四个变体都含 16/24/32/48), 无需缩放。
 ///
 /// 尺寸取自 `SM_CXSMICON`, 它在声明了 DPI 感知后会返回按当前缩放换算的真实像素,
 /// 所以高 DPI 屏上也能拿到清晰的图标。
 fn load_app_icon() -> HICON {
     unsafe {
         let hinst = GetModuleHandleW(ptr::null());
-        let name = wide("id");
         let cx = GetSystemMetrics(SM_CXSMICON);
         let cy = GetSystemMetrics(SM_CYSMICON);
+        // 资源 ID 当作 PCWSTR 传, 即 MAKEINTRESOURCE —— windows-sys 没有这个宏
+        let id = pick_icon_id() as usize as *const u16;
 
-        let icon = LoadImageW(hinst, name.as_ptr(), IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
+        let icon = LoadImageW(hinst, id, IMAGE_ICON, cx, cy, LR_DEFAULTCOLOR);
         if !icon.is_null() {
             return icon as HICON;
         }
 
         warn!("加载内嵌图标失败, 使用系统默认图标");
         LoadIconW(ptr::null_mut(), IDI_APPLICATION)
+    }
+}
+
+/// 换掉托盘当前的图标, 并销毁上一个。
+///
+/// 不加 `LR_SHARED` 的 `LoadImageW` 每次都会新建一个 HICON, 状态切换又比较频繁,
+/// 不回收的话会一直累积。
+fn apply_icon(data: &mut NOTIFYICONDATAW) {
+    let fresh = load_app_icon();
+    data.uFlags |= NIF_ICON;
+    data.hIcon = fresh;
+
+    let old = CURRENT_ICON.swap(fresh as isize, Ordering::SeqCst);
+    if old != 0 && old != fresh as isize {
+        unsafe { DestroyIcon(old as HICON) };
     }
 }
 
@@ -641,6 +735,39 @@ mod tests {
         fill_wide(&mut buf, "abcdefgh");
         assert_eq!(buf[3], 0, "最后一位必须是终止符");
         assert_eq!(&buf[..3], &[b'a' as u16, b'b' as u16, b'c' as u16]);
+    }
+
+    /// 四个图标 ID 必须都能从内嵌资源里取到。
+    ///
+    /// 这条测试守的是 assets/app.rc 与代码里常量的一致性 —— 改了资源脚本
+    /// 却忘了改常量的话, 运行时只会静默退回系统默认图标, 不容易发现。
+    #[test]
+    fn 四个图标资源都能加载() {
+        for id in [ICON_DARK_ON, ICON_DARK_OFF, ICON_LIGHT_ON, ICON_LIGHT_OFF] {
+            unsafe {
+                let hinst = GetModuleHandleW(ptr::null());
+                let icon = LoadImageW(
+                    hinst,
+                    id as usize as *const u16,
+                    IMAGE_ICON,
+                    16,
+                    16,
+                    LR_DEFAULTCOLOR,
+                );
+                assert!(!icon.is_null(), "图标资源 ID {id} 加载失败");
+                DestroyIcon(icon as HICON);
+            }
+        }
+    }
+
+    #[test]
+    fn 图标按主题与状态选取() {
+        // 四个组合必须落到四个不同的资源, 不能有重合
+        let all = [ICON_DARK_ON, ICON_DARK_OFF, ICON_LIGHT_ON, ICON_LIGHT_OFF];
+        let mut sorted = all;
+        sorted.sort_unstable();
+        assert_eq!(sorted.len(), 4);
+        assert!(sorted.windows(2).all(|w| w[0] != w[1]), "图标 ID 有重复");
     }
 
     #[test]

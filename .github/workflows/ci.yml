@@ -28,12 +28,28 @@ jobs:
       - name: Test
         run: cargo test
 
+      # 版本号在两处: Cargo.toml 和 assets/app.rc (后者编译进 app.res)。
+      # 因为 .res 是预编译提交的, 改了 Cargo.toml 版本却忘了重新生成资源时,
+      # exe 的文件属性会显示旧版本 —— 在这里拦住。
+      - name: Check exe version matches Cargo.toml
+        shell: pwsh
+        run: |
+          cargo build
+          $exeVer = (Get-Item target\debug\keyremap-ng.exe).VersionInfo.FileVersion
+          $line = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
+            Select-Object -First 1
+          $tomlVer = $line.Matches[0].Groups[1].Value
+          if (-not $exeVer) { throw "exe 里没有版本资源, app.res 可能没链接上" }
+          if ($exeVer -ne $tomlVer) {
+            throw "exe 版本 ($exeVer) 与 Cargo.toml ($tomlVer) 不一致 —— 请更新 assets/app.rc 的 FILEVERSION/FileVersion/ProductVersion 后跑 assets/build-res.ps1"
+          }
+          Write-Output "版本一致: $exeVer"
+
       # Web 工具内嵌的键名表必须与主程序导出的一致, 否则页面会生成
       # 主程序不认识的键名。生成办法见 docs/README.md。
       - name: Check web key table is in sync
         shell: pwsh
         run: |
-          cargo build
           # 必须用 Start-Process -Wait: 本程序是 GUI 子系统, 直接调用不会被 shell
           # 等待, 下一行读文件时它可能还没写出来。
           Start-Process -FilePath .\target\debug\keyremap-ng.exe `

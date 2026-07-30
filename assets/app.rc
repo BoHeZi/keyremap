@@ -1,2 +1,46 @@
-// app.rc
-id ICON "app_icon.ico"
+// keyremap-ng 的 Win32 资源脚本: 托盘图标的四个变体 + 文件版本信息。
+//
+// 改动本文件或图标后, 用 assets/build-res.ps1 重新生成 app.res。
+// 之所以提交预编译的 .res 而不在 build.rs 里现编译: 这样 `cargo build` 不需要
+// 任何资源编译器 (rc.exe / windres), 克隆下来就能直接构建。
+// 代价是版本号要手工同步, CI 会比对 exe 的版本资源与 Cargo.toml, 忘记时会失败。
+
+#pragma code_page(65001)
+
+// 图标。ID 1 同时也是 exe 在资源管理器里显示的图标 (系统取编号最小的那个)。
+// 四个变体的用途见 assets/make-icons.py。
+1 ICON "app_icon.ico"
+2 ICON "app_icon_off.ico"
+3 ICON "app_icon_inv.ico"
+4 ICON "app_icon_inv_off.ico"
+
+// VS_VERSION_INFO 的值就是 1, 直接写数字以免 #include <winver.h>
+1 VERSIONINFO
+FILEVERSION 0,1,0,0
+PRODUCTVERSION 0,1,0,0
+FILEFLAGSMASK 0x3FL
+FILEFLAGS 0x0L
+FILEOS 0x40004L
+FILETYPE 0x1L
+FILESUBTYPE 0x0L
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 0804 = 简体中文, 04B0 = 1200 (Unicode)
+        BLOCK "080404B0"
+        BEGIN
+            VALUE "CompanyName",      "huanfeng"
+            VALUE "FileDescription",  "Windows 键盘/鼠标重映射工具"
+            VALUE "FileVersion",      "0.1.0"
+            VALUE "InternalName",     "keyremap-ng"
+            VALUE "LegalCopyright",   "Copyright (c) 2026 huanfeng. MIT License"
+            VALUE "OriginalFilename", "keyremap-ng.exe"
+            VALUE "ProductName",      "keyremap-ng"
+            VALUE "ProductVersion",   "0.1.0"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x804, 1200
+    END
+END

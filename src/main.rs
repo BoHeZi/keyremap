@@ -10,6 +10,7 @@ mod config;
 mod hook;
 mod inject;
 mod keycode;
+mod singleton;
 mod tray;
 mod watcher;
 
@@ -19,6 +20,7 @@ use std::ptr;
 use clap::Parser;
 use log::{LevelFilter, error, info, warn};
 use tray_icon::menu::MenuEvent;
+use windows_sys::Win32::System::Console::FreeConsole;
 use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, PostQuitMessage, TranslateMessage,
@@ -46,7 +48,18 @@ struct Args {
     /// 输出键名表 (JSON) 后退出, 供 Web 配置工具消费
     #[arg(long)]
     dump_keys: bool,
+
+    /// 后台运行: 启动后关闭控制台窗口, 只留托盘图标
+    #[arg(short, long)]
+    daemon: bool,
+
+    /// 把日志写入 exe 同目录的 keyremap.log。后台运行时排查问题要靠它
+    #[arg(long)]
+    logfile: bool,
 }
+
+/// 单实例互斥体名。同一登录会话内只允许一个实例。
+const INSTANCE_NAME: &str = "keyremap-ng-single-instance";
 
 fn main() {
     let args = Args::parse();
@@ -56,10 +69,17 @@ fn main() {
         1 => LevelFilter::Debug,
         _ => LevelFilter::Trace,
     };
-    env_logger::Builder::new()
-        .filter_level(level)
-        .format_timestamp(None)
-        .init();
+    let mut builder = env_logger::Builder::new();
+    builder.filter_level(level).format_timestamp(None);
+    if args.logfile {
+        match log_file_path().and_then(|p| std::fs::File::create(p).ok()) {
+            Some(f) => {
+                builder.target(env_logger::Target::Pipe(Box::new(f)));
+            }
+            None => eprintln!("无法创建日志文件, 继续输出到控制台"),
+        }
+    }
+    builder.init();
 
     if args.dump_keys {
         print_keys_json();
@@ -110,6 +130,17 @@ fn main() {
         return;
     }
 
+    // 单实例检查放在装钩子之前。多个实例各装一套低级钩子会互相干扰:
+    // 事件被逐层处理, 表现为"禁用了却还在生效"这类难以排查的现象。
+    // --dump / --listen 只读不拦截, 不受此限制, 方便在服务运行时排查。
+    let _instance = match singleton::SingleInstance::acquire(INSTANCE_NAME) {
+        Some(i) => i,
+        None => {
+            error!("已有一个 keyremap-ng 实例在运行, 本次启动取消");
+            std::process::exit(1);
+        }
+    };
+
     let with_mouse = cfg.needs_mouse_hook();
     info!(
         "已启用 {} 条映射{}",
@@ -148,8 +179,24 @@ fn main() {
     };
 
     info!("=== 运行中, 通过托盘菜单退出 ===");
+
+    // 放到最后再收控制台: 前面的启动日志还要能看见。
+    // 之后的日志只有 --logfile 时才留得下来。
+    if args.daemon {
+        if !args.logfile {
+            info!("后台运行且未开启 --logfile, 后续日志将不可见");
+        }
+        unsafe { FreeConsole() };
+    }
+
     run_app_loop(&mut tray, &config_path);
     hook::uninstall();
+}
+
+fn log_file_path() -> Option<PathBuf> {
+    std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join("keyremap.log")))
 }
 
 /// 主消息循环。

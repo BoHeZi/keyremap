@@ -16,7 +16,9 @@ windows-sys = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
     "Win32_UI_Input_KeyboardAndMouse",
     "Win32_UI_Shell",          # ShellExecuteW: 打开配置文件/目录
-    "Win32_System_Threading",  # GetCurrentThreadId: 给监听线程回发消息用
+    "Win32_System_Threading",  # CreateMutexW / GetCurrentThreadId
+    "Win32_System_Console",    # FreeConsole: 后台运行时收起控制台
+    "Win32_Security",          # CreateMutexW 的 SECURITY_ATTRIBUTES 参数类型
 ] }
 # 关掉 default features: gtk / macos_fsevent 都是其他平台专用的
 tray-icon = { version = "0.24", default-features = false }

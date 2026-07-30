@@ -74,7 +74,19 @@ struct Args {
 }
 
 fn main() {
-    let args = Args::parse();
+    // 用 try_parse 而不是 parse: `--help` / `--version` 和参数错误都是由 clap
+    // 自己打印再退出的, 走 parse 的话那些输出发生在我们附上控制台**之前** ——
+    // GUI 子系统下 stdout 句柄是空的, 于是这几个命令一个字都看不见。
+    // 接过来自己补上控制台, 再让 clap 去打印。
+    let args = match Args::try_parse() {
+        Ok(a) => a,
+        Err(e) => {
+            console::ensure();
+            let _ = e.print();
+            console::pause_if_owned();
+            std::process::exit(if e.use_stderr() { 2 } else { 0 });
+        }
+    };
 
     // 必须在创建任何窗口之前声明 DPI 感知, 否则系统会对窗口做位图拉伸,
     // 菜单文字和托盘图标都会发虚。
@@ -97,16 +109,26 @@ fn main() {
 
     if args.dump_keys {
         emit(&keys_json(), args.output.as_deref());
+        console::pause_if_owned();
         return;
     }
 
     // 监听模式不需要配置文件, 也不受单实例限制 ——
     // 它只读不拦截, 正常实例运行时也该能用它查键名。
     if args.listen {
+        // 从根上避开"点一下窗口就卡住"的问题, 见 console::disable_quick_edit
+        console::disable_quick_edit();
+
         info!("=== 监听模式: 按键只显示不映射 ===");
-        info!("按 Ctrl+C 或关闭本窗口退出\n");
+        info!("按 Ctrl+C 或关闭本窗口退出");
+        info!("提示: 本窗口已关闭快速编辑, 想复制文字请用右键菜单里的\"标记\"");
+
         hook::set_listen_only(true);
-        if let Err(e) = hook::install(true) {
+        // 打印线程要先起来, 否则最初几个按键没人接。
+        // 更要紧的是: 打印绝不能发生在钩子回调里 —— 详见 hook::LISTEN_TX
+        hook::start_listen_printer();
+
+        if let Err(e) = hook::install() {
             error!("{e}");
             return;
         }
@@ -149,6 +171,7 @@ fn main() {
 
     if args.dump {
         emit(&dump_text(&cfg, &config_path), args.output.as_deref());
+        console::pause_if_owned();
         return;
     }
 
@@ -192,7 +215,8 @@ fn main() {
     }
 
     hook::set_config(cfg);
-    if let Err(e) = hook::install(with_mouse) {
+    // install 自己按配置决定要不要装鼠标钩子, 所以必须在 set_config 之后
+    if let Err(e) = hook::install() {
         error!("{e}");
         std::process::exit(1);
     }
@@ -360,6 +384,12 @@ fn run_app_loop() {
         // 文件监听线程发来的重载完成通知。这类消息 hwnd 为空,
         // 不会被 DispatchMessage 派发给任何窗口, 只能在这里自己认。
         if msg.message == watcher::WM_CONFIG_RELOADED {
+            // 新配置里可能刚出现 (或刚消失) 鼠标映射, 钩子要跟着调整。
+            // 必须在**这个**线程做: 低级钩子绑定在安装它的线程上, 而重载是
+            // 文件监听线程发起的, 在那边装出来的钩子永远不会被回调。
+            if let Err(e) = hook::sync_mouse_hook() {
+                warn!("{e}");
+            }
             tray::update_status();
             tray::notify("配置已重载", &tray_reload_text());
             continue;

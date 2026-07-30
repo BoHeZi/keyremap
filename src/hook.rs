@@ -13,7 +13,8 @@
 //!   超过 `LowLevelHooksTimeout` (默认 300ms) 钩子会被静默摘除。
 
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicUsize, Ordering};
+use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 use std::sync::{Arc, OnceLock, RwLock};
 
 use log::{debug, info, warn};
@@ -38,6 +39,21 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 
 /// 监听模式: 只打印不拦截, 用于让用户查出某个键叫什么名字。
 static LISTEN_ONLY: AtomicBool = AtomicBool::new(false);
+
+/// 监听模式的事件出口。回调只往这里投递, 格式化与打印都在另一个线程做。
+///
+/// **为什么不能在回调里直接打印**: 控制台一旦被鼠标选中 (快速编辑模式),
+/// `WriteConsole` 会一直阻塞到选区被取消。而钩子回调阻塞意味着**全系统的输入**
+/// 都在等它 —— 表现是整台机器卡死, 而不是只有本程序卡住。
+/// 顺带也躲开了回调里的堆分配 (键名 `to_string`)。
+static LISTEN_TX: OnceLock<SyncSender<(Input, bool)>> = OnceLock::new();
+
+/// 队列满时丢弃的事件数。丢几条日志远好过卡住整个系统的输入。
+static LISTEN_DROPPED: AtomicUsize = AtomicUsize::new(0);
+
+/// 监听队列容量。手速再快也到不了这个量级, 留这么多是为了让打印侧
+/// 被选区卡住几秒之后还能追上, 而不是立刻开始丢。
+const LISTEN_QUEUE: usize = 4096;
 
 /// 已安装的钩子句柄, 供退出时卸载。0 表示未安装。
 static KEYBOARD_HOOK: AtomicIsize = AtomicIsize::new(0);
@@ -115,24 +131,60 @@ pub fn set_listen_only(on: bool) {
     LISTEN_ONLY.store(on, Ordering::Relaxed);
 }
 
+/// 启动监听模式的打印线程。必须在装钩子之前调用, 否则最初几个事件没人接。
+///
+/// 把格式化和写控制台都挪到这个线程, 是为了让钩子回调无论如何都能立刻返回 ——
+/// 见 [`LISTEN_TX`] 的说明。
+pub fn start_listen_printer() {
+    let (tx, rx) = sync_channel::<(Input, bool)>(LISTEN_QUEUE);
+    if LISTEN_TX.set(tx).is_err() {
+        return; // 已经启动过了
+    }
+
+    std::thread::spawn(move || {
+        let mut reported = 0usize;
+        for (input, is_down) in rx {
+            let name = match input {
+                Input::Key(vk) => name_from_vk(vk)
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("未知键(VK=0x{vk:02X})")),
+                Input::Mouse(btn) => name_from_mouse(btn).to_string(),
+            };
+            info!("{name}  [{}]", if is_down { "按下" } else { "抬起" });
+
+            // 丢过事件就说一句。不说的话用户会以为自己没按到。
+            let dropped = LISTEN_DROPPED.load(Ordering::Relaxed);
+            if dropped > reported {
+                warn!(
+                    "输出跟不上, 已丢弃 {} 个事件 (终端窗口被鼠标选中会阻塞输出)",
+                    dropped - reported
+                );
+                reported = dropped;
+            }
+        }
+    });
+}
+
 // ---------- 匹配与处理 ----------
 
-/// 处理一个输入事件, 返回 true 表示该事件应被拦截 (不再传给后续应用)。
-fn handle(input: Input, is_down: bool) {
-    if LISTEN_ONLY.load(Ordering::Relaxed) {
-        let name = match input {
-            Input::Key(vk) => name_from_vk(vk)
-                .map(str::to_string)
-                .unwrap_or_else(|| format!("未知键(VK=0x{vk:02X})")),
-            Input::Mouse(btn) => name_from_mouse(btn).to_string(),
-        };
-        info!("{name}  [{}]", if is_down { "按下" } else { "抬起" });
+/// 监听模式下把事件投给打印线程。
+///
+/// 回调热路径: 一次原子读 + 一次不阻塞的投递, 不分配、不格式化、不碰 IO。
+/// 队列满就丢并计数 —— 宁可少打一行日志, 也不能让回调等在这里。
+fn report(input: Input, is_down: bool) {
+    if !LISTEN_ONLY.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(tx) = LISTEN_TX.get()
+        && let Err(TrySendError::Full(_)) = tx.try_send((input, is_down))
+    {
+        LISTEN_DROPPED.fetch_add(1, Ordering::Relaxed);
     }
 }
 
 /// 查找并执行匹配的映射。返回 true 表示原事件应被吞掉。
 fn dispatch(input: Input, is_down: bool) -> bool {
-    handle(input, is_down);
+    report(input, is_down);
 
     if LISTEN_ONLY.load(Ordering::Relaxed) || !ENABLED.load(Ordering::Relaxed) {
         return false;
@@ -227,28 +279,70 @@ fn decode_mouse(msg: u32, mouse_data: u32) -> Option<(MouseButton, bool)> {
 
 // ---------- 安装 / 卸载 / 消息循环 ----------
 
-/// 安装钩子。`with_mouse` 为 false 时不装鼠标钩子, 省掉全部鼠标事件的回调开销。
-pub fn install(with_mouse: bool) -> Result<(), String> {
-    unsafe {
-        let kh = SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), ptr::null_mut(), 0);
-        if kh.is_null() {
-            return Err("安装键盘钩子失败".into());
-        }
-        KEYBOARD_HOOK.store(kh as isize, Ordering::SeqCst);
-        debug!("键盘钩子已安装");
-
-        if with_mouse {
-            let mh = SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), ptr::null_mut(), 0);
-            if mh.is_null() {
-                return Err("安装鼠标钩子失败".into());
-            }
-            MOUSE_HOOK.store(mh as isize, Ordering::SeqCst);
-            debug!("鼠标钩子已安装");
-        } else {
-            debug!("配置中无鼠标映射, 跳过鼠标钩子");
-        }
+/// 安装钩子。键盘钩子总是装, 鼠标钩子按当前配置决定 (没有鼠标映射时不装,
+/// 省掉全部鼠标移动事件的回调开销)。
+///
+/// 要不要装鼠标钩子只从配置里读, **不接参数**。以前这里收一个 `with_mouse`,
+/// 那等于把配置的一个瞬时快照变成了永久决定: 首次运行是空配置, 于是不装鼠标钩子,
+/// 之后用户加了鼠标映射、热重载也只换了配置而没人去补装钩子, 鼠标映射就一直
+/// 不生效 —— 而且不报错, 直到重启才好。
+///
+/// 调用前必须先 [`set_config`]。
+pub fn install() -> Result<(), String> {
+    let kh = unsafe { SetWindowsHookExW(WH_KEYBOARD_LL, Some(keyboard_proc), ptr::null_mut(), 0) };
+    if kh.is_null() {
+        return Err("安装键盘钩子失败".into());
     }
+    KEYBOARD_HOOK.store(kh as isize, Ordering::SeqCst);
+    debug!("键盘钩子已安装");
+
+    sync_mouse_hook()?;
     Ok(())
+}
+
+/// 让鼠标钩子的安装状态与当前配置一致, 返回是否发生了变化。启动和每次热重载后调用。
+///
+/// **必须在跑消息循环的那个线程上调用。** 低级钩子绑定在安装它的线程上, 由系统在
+/// 该线程的消息派发中回调 —— 在文件监听线程上装出来的钩子永远不会被调用。
+/// 所以热重载走的是"监听线程 PostThreadMessage → 主线程调用这里"这条路。
+pub fn sync_mouse_hook() -> Result<bool, String> {
+    // 监听模式要能报出鼠标侧键叫什么名字, 所以无条件装 —— 那种模式下
+    // 根本没有配置可查 (它不读配置文件)。
+    let listening = LISTEN_ONLY.load(Ordering::Relaxed);
+    let needed = listening
+        || current_config()
+            .map(|c| c.needs_mouse_hook())
+            .unwrap_or(false);
+    let installed = MOUSE_HOOK.load(Ordering::SeqCst) != 0;
+
+    if needed == installed {
+        return Ok(false);
+    }
+
+    if needed {
+        let mh = unsafe { SetWindowsHookExW(WH_MOUSE_LL, Some(mouse_proc), ptr::null_mut(), 0) };
+        if mh.is_null() {
+            return Err("安装鼠标钩子失败".into());
+        }
+        MOUSE_HOOK.store(mh as isize, Ordering::SeqCst);
+        if listening {
+            info!("已装上鼠标钩子 (监听模式要能报出鼠标键名)");
+        } else {
+            info!("配置里有鼠标映射, 已装上鼠标钩子");
+        }
+    } else {
+        let h = MOUSE_HOOK.swap(0, Ordering::SeqCst);
+        if h != 0 {
+            unsafe { UnhookWindowsHookEx(h as *mut _) };
+        }
+        info!("配置里已无鼠标映射, 卸掉鼠标钩子");
+    }
+    Ok(true)
+}
+
+/// 鼠标钩子当前是否装着。托盘用它显示实际状态。
+pub fn mouse_hook_active() -> bool {
+    MOUSE_HOOK.load(Ordering::SeqCst) != 0
 }
 
 pub fn uninstall() {

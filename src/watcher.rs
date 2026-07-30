@@ -78,12 +78,17 @@ fn is_target(changed: &Path, target: &Path) -> bool {
 }
 
 /// 立即重新读取配置并替换到钩子层, 返回生效的映射条数。
-/// 托盘菜单的"重新加载配置"和文件监听共用这条路径。
+/// 托盘菜单的"重新加载配置"走这条路径。
+///
+/// **只能在跑消息循环的线程上调用** (托盘的窗口过程就在那个线程)。
+/// 里面会按新配置增减鼠标钩子, 而低级钩子只在安装它的线程上被回调。
+/// 文件监听线程不能直接调这里, 它走的是"改配置 + 发消息让主线程收尾"。
 pub fn reload_now(path: &Path) -> Result<usize, String> {
     let cfg = config::load(path)?;
     let n = cfg.active_count();
     config::warn_conflicts(&cfg);
     hook::set_config(cfg);
+    hook::sync_mouse_hook()?;
     Ok(n)
 }
 

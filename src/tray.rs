@@ -199,15 +199,22 @@ fn status_text() -> String {
     let n = hook::config_snapshot()
         .map(|c| c.active_count())
         .unwrap_or(0);
-    // 带上当前实际权限: 菜单里的勾选反映的是"偏好", 这里反映的是"此刻是否真的
-    // 以管理员在跑" —— 两者可以不一致 (刚改完偏好还没重启时就是)。
     format!(
-        "keyremap — {} ({n} 条映射生效){}",
+        "keyremap — {} ({n} 条映射生效){}{}",
         if hook::is_enabled() {
             "已启用"
         } else {
             "已禁用"
         },
+        // 鼠标钩子是按需装的, 把它露出来: 否则"鼠标映射不生效"这种情况
+        // 用户完全无从判断是配置没写对还是钩子没装上。
+        if hook::mouse_hook_active() {
+            " · 含鼠标"
+        } else {
+            ""
+        },
+        // 带上当前实际权限: 菜单里的勾选反映的是"偏好", 这里反映的是"此刻是否真的
+        // 以管理员在跑" —— 两者可以不一致 (刚改完偏好还没重启时就是)。
         if elevate::is_elevated() {
             " · 管理员"
         } else {

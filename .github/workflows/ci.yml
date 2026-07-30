@@ -27,3 +27,34 @@ jobs:
 
       - name: Test
         run: cargo test
+
+      # Web 工具内嵌的键名表必须与主程序导出的一致, 否则页面会生成
+      # 主程序不认识的键名。生成办法见 web/README.md。
+      - name: Check web key table is in sync
+        shell: pwsh
+        run: |
+          cargo build
+          # 必须用 Start-Process -Wait: 本程序是 GUI 子系统, 直接调用不会被 shell
+          # 等待, 下一行读文件时它可能还没写出来。
+          Start-Process -FilePath .\target\debug\keyremap-ng.exe `
+            -ArgumentList "--dump-keys","-o","keys-fresh.json" -NoNewWindow -Wait
+          if (-not (Test-Path keys-fresh.json)) { throw "导出键名表失败, 文件未生成" }
+
+          $fresh = (Get-Content keys-fresh.json -Raw) | ConvertFrom-Json
+          $raw = (Get-Content web\keys.js -Raw) `
+            -replace '(?s)^\s*window\.KEYREMAP_KEYS\s*=\s*', '' -replace '(?s);\s*$', ''
+          $embedded = $raw | ConvertFrom-Json
+
+          # 断言两边都真的有数据: 否则"读不到"会和"一致"落进同一个分支,
+          # 校验就永远是绿的了。
+          if (-not $fresh.keys -or $fresh.keys.Count -eq 0) { throw "主程序导出的键名表为空" }
+          if (-not $embedded.keys -or $embedded.keys.Count -eq 0) { throw "web/keys.js 解析不出键名" }
+
+          if (Compare-Object $fresh.keys $embedded.keys) {
+            throw "web/keys.js 的键盘键名与主程序不一致, 请按 web/README.md 重新生成"
+          }
+          if (Compare-Object $fresh.mouse $embedded.mouse) {
+            throw "web/keys.js 的鼠标键名与主程序不一致, 请按 web/README.md 重新生成"
+          }
+          Remove-Item keys-fresh.json
+          Write-Output "keys.js 与主程序一致: $($fresh.keys.Count) 个键盘键, $($fresh.mouse.Count) 个鼠标键"

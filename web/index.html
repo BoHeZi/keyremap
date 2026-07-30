@@ -1,0 +1,182 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>keyremap-ng 配置工具</title>
+<link rel="stylesheet" href="style.css">
+</head>
+<!-- 不在 body 上用 x-cloak: 万一 Alpine 没加载起来, 整页都会不可见 -->
+<body x-data="configApp()">
+
+<header>
+  <h1>keyremap-ng 配置工具</h1>
+  <div class="toolbar">
+    <button @click="openFile()" x-text="restoreName ? `继续编辑 ${restoreName}` : '打开配置文件'"></button>
+    <button class="ghost" @click="newConfig()">从空白开始</button>
+    <span class="badge" x-text="mode"></span>
+  </div>
+</header>
+
+<div class="notice warn" x-show="!hasFSA" x-cloak>
+  当前浏览器不支持直接读写本地文件（Chrome / Edge 支持）。仍可正常编辑，
+  完成后用<strong>复制 TOML</strong> 粘贴进配置文件即可。
+</div>
+
+<div class="notice" :class="{ error: noteError }" x-show="note" x-text="note" x-cloak></div>
+
+<section>
+  <div class="section-head">
+    <h2>映射</h2>
+    <button @click="addMapping()">+ 添加一条</button>
+  </div>
+
+  <div class="notice" x-show="mappings.length === 0">
+    还没有映射。点「+ 添加一条」开始，或先打开已有的配置文件。
+  </div>
+
+  <template x-for="m in mappings" :key="m._id">
+    <div class="mapping" :class="{ inactive: !isActive(m), conflict: isConflicted(m) }">
+      <div class="field">
+        <label>名称</label>
+        <input type="text" x-model="m.name" placeholder="可留空">
+      </div>
+
+      <div class="field">
+        <label>组</label>
+        <input type="text" x-model="m.group" placeholder="未分组" list="group-list">
+      </div>
+
+      <div class="field">
+        <label>输入 (from)</label>
+        <div class="key-picker">
+          <select x-model="m.from">
+            <optgroup label="键盘">
+              <template x-for="k in KEYS.keys" :key="k">
+                <option :value="k" x-text="k"></option>
+              </template>
+            </optgroup>
+            <optgroup label="鼠标">
+              <template x-for="k in KEYS.mouse" :key="k">
+                <option :value="k" x-text="k"></option>
+              </template>
+            </optgroup>
+          </select>
+          <button class="ghost" @click="startCapture(m)">捕获</button>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>输出 (to)</label>
+        <!-- 能拆成"若干修饰键 + 一个主键"时给友好界面, 否则退回原始文本, 避免丢数据 -->
+        <template x-if="isSimpleTo(m)">
+          <div>
+            <div class="mods">
+              <template x-for="mod in MODIFIERS" :key="mod">
+                <label>
+                  <input type="checkbox" :checked="hasMod(m, mod)"
+                         @change="setMod(m, mod, $event.target.checked)">
+                  <span x-text="mod"></span>
+                </label>
+              </template>
+            </div>
+            <select :value="mainKey(m)" @change="setMainKey(m, $event.target.value)">
+              <template x-for="k in KEYS.keys" :key="k">
+                <option :value="k" x-text="k"></option>
+              </template>
+            </select>
+          </div>
+        </template>
+        <template x-if="!isSimpleTo(m)">
+          <input type="text" :value="m.to.join(', ')"
+                 @input="m.to = $event.target.value.split(',').map(s => s.trim()).filter(Boolean)"
+                 placeholder="Ctrl, W">
+        </template>
+      </div>
+
+      <label class="toggle">
+        <input type="checkbox" x-model="m.enable">
+        <span>启用</span>
+      </label>
+
+      <button class="icon" @click="removeMapping(m)">删除</button>
+    </div>
+  </template>
+
+  <datalist id="group-list">
+    <template x-for="g in groups" :key="g">
+      <option :value="g"></option>
+    </template>
+  </datalist>
+</section>
+
+<section x-show="groups.length > 0" x-cloak>
+  <div class="section-head">
+    <h2>组开关</h2>
+    <span class="hint">关掉的组，组内映射全部不生效</span>
+  </div>
+  <div class="chips">
+    <template x-for="g in groups" :key="g">
+      <label class="chip" :class="{ off: groupEnabled[g] === false }">
+        <input type="checkbox" :checked="groupEnabled[g] !== false"
+               @change="setGroupEnabled(g, $event.target.checked)">
+        <span x-text="`${g} (${countInGroup(g)})`"></span>
+      </label>
+    </template>
+  </div>
+</section>
+
+<section x-show="conflicts.length > 0" x-cloak>
+  <h2>冲突</h2>
+  <template x-for="(c, i) in conflicts" :key="i">
+    <div class="notice warn" style="margin-top:.5rem"
+         x-text="`${c[0].from} 已被「${c[0].name || '(未命名)'}」占用，「${c[1].name || '(未命名)'}」不会生效 —— 匹配是先到先得。`">
+    </div>
+  </template>
+</section>
+
+<section>
+  <div class="section-head">
+    <h2>配置文件内容</h2>
+    <div class="toolbar">
+      <button @click="saveFile()" :disabled="!fileHandle">保存到文件</button>
+      <button class="ghost" @click="copyToml()">复制 TOML</button>
+      <button class="ghost" @click="downloadToml()">下载</button>
+    </div>
+  </div>
+  <pre x-text="toml"></pre>
+</section>
+
+<footer>
+  <p>
+    保存后主程序会自动重载并弹出提示，不需要重启。
+    键名表由 <code>keyremap-ng --dump-keys</code> 生成，与主程序同源。
+  </p>
+</footer>
+
+<!-- 按键捕获浮层 -->
+<div id="capture-overlay" x-show="capturing" x-cloak
+     @keydown.window.prevent.stop="onCaptureKey($event)"
+     @contextmenu.window.prevent="capturing && null">
+  <div class="capture-box">
+    <p class="capture-title">按下要捕获的键</p>
+    <p class="capture-hint">
+      键盘直接按，Esc 取消；鼠标按键请点下方按钮。<br>
+      <strong>Ctrl+W / Ctrl+T 等被浏览器占用</strong>，组合键请用修饰键勾选框来搭。
+    </p>
+    <div class="capture-mouse">
+      <template x-for="b in KEYS.mouse" :key="b">
+        <button @click="finishCapture(b)" x-text="b"></button>
+      </template>
+    </div>
+    <button class="ghost" @click="finishCapture(null)">取消</button>
+  </div>
+</div>
+
+<!-- 键名表由 keyremap-ng --dump-keys 生成。用 script 而不是 fetch json,
+     是为了让页面直接双击 (file://) 打开时也能工作 —— fetch 会被 CORS 挡住。 -->
+<script src="keys.js"></script>
+<script src="app.js"></script>
+<script defer src="vendor/alpine.min.js"></script>
+</body>
+</html>

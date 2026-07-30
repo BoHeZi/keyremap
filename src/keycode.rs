@@ -96,7 +96,10 @@ pub const KEY_TABLE: &[(&str, u16)] = &[
 
 /// 按名字解析输入源, 键盘和鼠标统一入口。配置加载时调用, 不在热路径上。
 pub fn input_from_name(name: &str) -> Option<Input> {
-    if let Some((_, btn)) = MOUSE_TABLE.iter().find(|(n, _)| n.eq_ignore_ascii_case(name)) {
+    if let Some((_, btn)) = MOUSE_TABLE
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+    {
         return Some(Input::Mouse(*btn));
     }
     vk_from_name(name).map(Input::Key)

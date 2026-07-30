@@ -204,7 +204,13 @@ unsafe fn show_menu(hwnd: HWND) {
     }
 
     unsafe {
-        let checked = |on: bool| if on { MF_STRING | MF_CHECKED } else { MF_STRING };
+        let checked = |on: bool| {
+            if on {
+                MF_STRING | MF_CHECKED
+            } else {
+                MF_STRING
+            }
+        };
 
         let label = wide("启用映射");
         AppendMenuW(
@@ -275,7 +281,11 @@ fn handle_command(id: u32) {
             update_status();
             notify(
                 "keyremap-ng",
-                if on { "映射已启用" } else { "映射已禁用" },
+                if on {
+                    "映射已启用"
+                } else {
+                    "映射已禁用"
+                },
             );
         }
         ID_RELOAD => {

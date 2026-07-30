@@ -129,6 +129,9 @@ fn main() {
         }
     };
 
+    // 输入源撞车的话在这里就说出来, 别等用户按了半天发现某条从来没生效
+    config::warn_conflicts(&cfg);
+
     if args.dump {
         emit(&dump_text(&cfg), args.output.as_deref());
         return;
@@ -232,6 +235,19 @@ fn dump_text(cfg: &config::Config) -> String {
             }
         }
     }
+    let conflicts = cfg.find_conflicts();
+    if !conflicts.is_empty() {
+        text.push_str("\n冲突 (先到先得, 被遮盖的那条不会生效):\n");
+        for (first, shadowed) in conflicts {
+            text.push_str(&format!(
+                "  {} 被「{}」占用, 「{}」不生效\n",
+                cfg.mappings[first].input_name(),
+                cfg.mappings[first].name,
+                cfg.mappings[shadowed].name,
+            ));
+        }
+    }
+
     text.push_str("\n状态: on=生效  off=该条已关闭  grp=所属组已关闭");
     text
 }

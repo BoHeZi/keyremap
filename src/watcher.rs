@@ -82,6 +82,7 @@ fn is_target(changed: &Path, target: &Path) -> bool {
 pub fn reload_now(path: &Path) -> Result<usize, String> {
     let cfg = config::load(path)?;
     let n = cfg.active_count();
+    config::warn_conflicts(&cfg);
     hook::set_config(cfg);
     Ok(n)
 }
@@ -116,6 +117,7 @@ fn reload_if_changed(path: &Path, main_thread: u32, last_hash: &Mutex<u64>) {
     match config::parse(&content) {
         Ok(cfg) => {
             let n = cfg.active_count();
+            config::warn_conflicts(&cfg);
             hook::set_config(cfg);
             info!("配置已重载, {n} 条映射生效");
             // 通知主线程刷新托盘菜单。用 PostThreadMessage 而不是共享标志位,

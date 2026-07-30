@@ -107,14 +107,21 @@ impl Mapping {
             format!("{}  ({})", self.name, self)
         }
     }
+
+    /// 输入源的显示名。
+    ///
+    /// 不叫 from_name 是因为 `from_*` 在 Rust 里通常表示构造函数, clippy 会提醒。
+    pub fn input_name(&self) -> String {
+        match self.from {
+            Input::Key(vk) => name_from_vk(vk).unwrap_or("?").to_string(),
+            Input::Mouse(btn) => name_from_mouse(btn).to_string(),
+        }
+    }
 }
 
 impl fmt::Display for Mapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let from = match self.from {
-            Input::Key(vk) => name_from_vk(vk).unwrap_or("?").to_string(),
-            Input::Mouse(btn) => name_from_mouse(btn).to_string(),
-        };
+        let from = self.input_name();
         let to = self
             .to
             .iter()
@@ -175,6 +182,45 @@ impl Config {
             .iter()
             .enumerate()
             .filter(move |(_, m)| m.group == index)
+    }
+
+    /// 找出输入源相同的生效映射, 返回 (先命中的下标, 被遮盖的下标)。
+    ///
+    /// 匹配是先到先得 —— `hook::dispatch` 命中第一条就返回, 后面同 `from` 的
+    /// 映射永远不会被执行, 而程序此前对此没有任何提示, 这种静默失效很难排查。
+    ///
+    /// 只检查**同时生效**的条目: 用两个互斥的组切换同一个键的不同映射
+    /// (比如"游戏模式"和"办公模式") 是合理用法, 只要它们不同时启用就不算冲突。
+    pub fn find_conflicts(&self) -> Vec<(usize, usize)> {
+        let active: Vec<usize> = self
+            .mappings
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| self.is_active(m))
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut conflicts = Vec::new();
+        for (a, &i) in active.iter().enumerate() {
+            for &j in &active[a + 1..] {
+                if self.mappings[i].from == self.mappings[j].from {
+                    conflicts.push((i, j));
+                }
+            }
+        }
+        conflicts
+    }
+}
+
+/// 把配置里的冲突以警告形式打进日志。加载与热重载都会走这里。
+pub fn warn_conflicts(cfg: &Config) {
+    for (first, shadowed) in cfg.find_conflicts() {
+        log::warn!(
+            "配置冲突: 「{}」已占用 {}, 「{}」不会生效",
+            cfg.mappings[first].label(),
+            cfg.mappings[first].input_name(),
+            cfg.mappings[shadowed].label(),
+        );
     }
 }
 
@@ -379,6 +425,70 @@ to = "Esc"
         .unwrap();
         assert_eq!(cfg.active_count(), 0);
         assert!(cfg.needs_mouse_hook());
+    }
+
+    #[test]
+    fn 同时生效的重复输入源算冲突() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+name = "第一条"
+from = "Pause"
+to = "Insert"
+
+[[mappings]]
+name = "被遮盖"
+from = "Pause"
+to = "Delete"
+"#,
+        )
+        .unwrap();
+        let c = cfg.find_conflicts();
+        assert_eq!(c, vec![(0, 1)], "后一条永远不会被匹配到");
+    }
+
+    #[test]
+    fn 分属互斥组的相同输入源不算冲突() {
+        // 用两个组切换同一个键的不同映射是合理用法
+        let cfg = parse(
+            r#"
+[groups]
+"办公" = false
+
+[[mappings]]
+group = "游戏"
+from = "Pause"
+to = "Insert"
+
+[[mappings]]
+group = "办公"
+from = "Pause"
+to = "Delete"
+"#,
+        )
+        .unwrap();
+        assert!(
+            cfg.find_conflicts().is_empty(),
+            "两组不同时生效, 不该报冲突"
+        );
+    }
+
+    #[test]
+    fn 自身禁用的条目不参与冲突判定() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "Pause"
+to = "Insert"
+
+[[mappings]]
+enable = false
+from = "Pause"
+to = "Delete"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.find_conflicts().is_empty());
     }
 
     #[test]

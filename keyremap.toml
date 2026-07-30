@@ -1,0 +1,35 @@
+name = "默认配置"
+
+# 单键映射: 写成 from = "..." / to = "..."
+# 组合键映射: to 写成数组, 例如 to = ["Ctrl", "W"]
+#
+# 用 `keyremap-ng --listen` 可以查看按下的键叫什么名字。
+# 用 `keyremap-ng --dump-keys` 可以列出全部可用键名。
+
+[[mappings]]
+name = "Pause转Insert"
+comment = "把不常用的 Pause 键变成 Insert"
+from = "Pause"
+to = "Insert"
+
+[[mappings]]
+name = "鼠标侧键转Ctrl+W"
+comment = "鼠标前进键关闭当前标签页"
+from = "MouseX2"
+to = ["Ctrl", "W"]
+
+# 下面两条互为反向映射, 用来验证防回环。
+# 把两条都改成 enable = true, 按 D 应当出 E、按 E 应当出 D, 且不会无限循环。
+# (旧的 rdev 版本因为注入事件没有标记, 这种配置会直接死循环, 只能禁用)
+# 验证完记得改回 false, 否则打字会很痛苦。
+[[mappings]]
+name = "D转E"
+enable = false
+from = "D"
+to = "E"
+
+[[mappings]]
+name = "E转D"
+enable = false
+from = "E"
+to = "D"

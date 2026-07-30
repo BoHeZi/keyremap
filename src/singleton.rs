@@ -22,7 +22,7 @@ pub fn name_for_current_exe() -> String {
     let path = std::env::current_exe().unwrap_or_default();
     let mut h = DefaultHasher::new();
     path.to_string_lossy().to_lowercase().hash(&mut h);
-    format!("keyremap-ng-{:016x}", h.finish())
+    format!("keyremap-{:016x}", h.finish())
 }
 
 /// 持有一个命名互斥体, 存活期间其他实例无法启动。

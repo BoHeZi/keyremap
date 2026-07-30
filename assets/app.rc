@@ -1,4 +1,4 @@
-// keyremap-ng 的 Win32 资源脚本: 托盘图标的四个变体 + 文件版本信息。
+// keyremap 的 Win32 资源脚本: 托盘图标的四个变体 + 文件版本信息。
 //
 // 改动本文件或图标后, 用 assets/build-res.ps1 重新生成 app.res。
 // 之所以提交预编译的 .res 而不在 build.rs 里现编译: 这样 `cargo build` 不需要
@@ -32,10 +32,10 @@ BEGIN
             VALUE "CompanyName",      "huanfeng"
             VALUE "FileDescription",  "Windows 键盘/鼠标重映射工具"
             VALUE "FileVersion",      "0.1.0"
-            VALUE "InternalName",     "keyremap-ng"
+            VALUE "InternalName",     "keyremap"
             VALUE "LegalCopyright",   "Copyright (c) 2026 huanfeng. MIT License"
-            VALUE "OriginalFilename", "keyremap-ng.exe"
-            VALUE "ProductName",      "keyremap-ng"
+            VALUE "OriginalFilename", "keyremap.exe"
+            VALUE "ProductName",      "keyremap"
             VALUE "ProductVersion",   "0.1.0"
         END
     END

@@ -2,7 +2,7 @@
 // 见 console 模块。
 #![windows_subsystem = "windows"]
 
-//! keyremap-ng: Windows 键盘/鼠标重映射。
+//! keyremap: Windows 键盘/鼠标重映射。
 //!
 //! 全部功能都跑在一个线程上: 低级钩子的回调、托盘窗口消息、配置重载通知
 //! 共用同一个消息循环。低级钩子本来就需要消息泵, 托盘图标也需要窗口,
@@ -15,6 +15,7 @@ mod elevate;
 mod hook;
 mod inject;
 mod keycode;
+mod regutil;
 mod singleton;
 mod tray;
 mod watcher;
@@ -124,7 +125,7 @@ fn main() {
         Err(e) => {
             error!("{e}");
             // GUI 子系统下没有控制台时错误会彻底消失, 用消息框兜底
-            tray::show_error("keyremap-ng: 配置加载失败", &e);
+            tray::show_error("keyremap: 配置加载失败", &e);
             std::process::exit(1);
         }
     };
@@ -137,6 +138,20 @@ fn main() {
         return;
     }
 
+    // 用户要求以管理员身份运行、而当前不是的话, 换一个提权的进程接手。
+    //
+    // 必须放在拿单实例锁**之前**: 否则本进程持锁期间新进程会被挡在门外,
+    // 而本进程又在等新进程起来, 变成死结。
+    if elevate::wants_admin() && !elevate::is_elevated() {
+        if elevate::restart_as_admin(&config_path) {
+            info!("已交给管理员权限的新实例, 本进程退出");
+            return;
+        }
+        // UAC 被取消时降级继续跑, 而不是干脆不启动 —— 后者更糟。
+        // 提权失败不会循环: 新进程起不来, 这里就直接往下走了。
+        warn!("提权未成功, 以普通权限继续运行 (对管理员权限的窗口将不生效)");
+    }
+
     // 单实例检查放在装钩子之前。多个实例各装一套低级钩子会互相干扰:
     // 事件被逐层处理, 表现为"禁用了却还在生效"这类难以排查的现象。
     //
@@ -145,9 +160,9 @@ fn main() {
     let _instance = match singleton::SingleInstance::acquire(&singleton::name_for_current_exe()) {
         Some(i) => i,
         None => {
-            let msg = "这个位置的 keyremap-ng 已经在运行了";
+            let msg = "这个位置的 keyremap 已经在运行了";
             error!("{msg}, 本次启动取消");
-            tray::show_error("keyremap-ng", msg);
+            tray::show_error("keyremap", msg);
             std::process::exit(1);
         }
     };
@@ -166,6 +181,13 @@ fn main() {
     if let Err(e) = hook::install(with_mouse) {
         error!("{e}");
         std::process::exit(1);
+    }
+
+    // 让自启机制与"以管理员启动"偏好保持一致。
+    // 用户刚打开该偏好时还没有权限建计划任务, 提权重启后由这里补上,
+    // 并把旧的 Run 项清掉。幂等, 已经一致时不做任何写入。
+    if let Err(e) = autostart::sync(&config_path) {
+        warn!("自启机制同步失败: {e}");
     }
 
     // 文件监听要在托盘之前起来, 这样启动后立刻改配置也不会漏掉。

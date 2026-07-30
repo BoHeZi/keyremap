@@ -62,7 +62,7 @@ fn ensure_impl(force_new: bool) -> bool {
 /// 必须重新打开 CONOUT$ / CONIN$ 并设回去, 否则 println! 出来的东西看不见。
 ///
 /// 但**只接管无效的句柄**: 已经被重定向到文件或管道的不能动, 否则
-/// `keyremap-ng --dump-keys > keys.json` 会写不进文件 —— 而 Web 配置工具
+/// `keyremap --dump-keys > keys.json` 会写不进文件 —— 而 Web 配置工具
 /// 正是靠这条命令取键名表的。
 fn rebind_std_handles() {
     unsafe {

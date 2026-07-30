@@ -3,14 +3,14 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>keyremap-ng 配置工具</title>
+<title>keyremap 配置工具</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <!-- 不在 body 上用 x-cloak: 万一 Alpine 没加载起来, 整页都会不可见 -->
 <body x-data="configApp()">
 
 <header>
-  <h1>keyremap-ng 配置工具</h1>
+  <h1>keyremap 配置工具</h1>
   <div class="toolbar">
     <button @click="openFile()" x-text="restoreName ? `继续编辑 ${restoreName}` : '打开配置文件'"></button>
     <button class="ghost" @click="newConfig()">从空白开始</button>
@@ -150,7 +150,7 @@
 <footer>
   <p>
     保存后主程序会自动重载并弹出提示，不需要重启。
-    键名表由 <code>keyremap-ng --dump-keys</code> 生成，与主程序同源。
+    键名表由 <code>keyremap --dump-keys</code> 生成，与主程序同源。
   </p>
 </footer>
 
@@ -173,7 +173,7 @@
   </div>
 </div>
 
-<!-- 键名表由 keyremap-ng --dump-keys 生成。用 script 而不是 fetch json,
+<!-- 键名表由 keyremap --dump-keys 生成。用 script 而不是 fetch json,
      是为了让页面直接双击 (file://) 打开时也能工作 —— fetch 会被 CORS 挡住。 -->
 <script src="keys.js"></script>
 <script src="app.js"></script>

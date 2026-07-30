@@ -1,4 +1,4 @@
-# keyremap-ng 配置工具（Web）
+# keyremap 配置工具（Web）
 
 纯静态页面，无构建步骤。可视化编辑 `keyremap.toml`：按键捕获、组合键搭配、分组管理、冲突提示。
 
@@ -27,7 +27,7 @@ Firefox / Safari 没有 FSA API，会自动落到这条路。
 `keys.js` 是从主程序导出的，**不要手改**。主程序的键名表变动后重新生成：
 
 ```bash
-keyremap-ng --dump-keys -o docs/keys.json
+keyremap --dump-keys -o docs/keys.json
 # 包装成 script 可加载的形式
 { printf 'window.KEYREMAP_KEYS = '; cat docs/keys.json; printf ';\n'; } > docs/keys.js
 ```
@@ -35,7 +35,7 @@ keyremap-ng --dump-keys -o docs/keys.json
 PowerShell：
 
 ```powershell
-.\keyremap-ng.exe --dump-keys -o docs\keys.json
+.\keyremap.exe --dump-keys -o docs\keys.json
 "window.KEYREMAP_KEYS = " + (Get-Content docs\keys.json -Raw) + ";" | Set-Content docs\keys.js
 ```
 

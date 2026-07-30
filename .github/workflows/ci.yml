@@ -35,7 +35,7 @@ jobs:
         shell: pwsh
         run: |
           cargo build
-          $exeVer = (Get-Item target\debug\keyremap-ng.exe).VersionInfo.FileVersion
+          $exeVer = (Get-Item target\debug\keyremap.exe).VersionInfo.FileVersion
           $line = Select-String -Path Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' |
             Select-Object -First 1
           $tomlVer = $line.Matches[0].Groups[1].Value
@@ -52,7 +52,7 @@ jobs:
         run: |
           # 必须用 Start-Process -Wait: 本程序是 GUI 子系统, 直接调用不会被 shell
           # 等待, 下一行读文件时它可能还没写出来。
-          Start-Process -FilePath .\target\debug\keyremap-ng.exe `
+          Start-Process -FilePath .\target\debug\keyremap.exe `
             -ArgumentList "--dump-keys","-o","keys-fresh.json" -NoNewWindow -Wait
           if (-not (Test-Path keys-fresh.json)) { throw "导出键名表失败, 文件未生成" }
 

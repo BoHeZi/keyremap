@@ -1,5 +1,5 @@
 [package]
-name = "keyremap-ng"
+name = "keyremap"
 version = "0.1.0"
 edition = "2024"
 description = "Windows 键盘/鼠标重映射工具"

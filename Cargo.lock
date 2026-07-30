@@ -306,7 +306,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "keyremap-ng"
+name = "keyremap"
 version = "0.1.0"
 dependencies = [
  "clap",

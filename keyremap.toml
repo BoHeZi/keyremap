@@ -1,14 +1,14 @@
 name = "默认配置"
 
-# 托盘菜单里"图形配置工具"打开的地址。留空则用仓库自带的 GitHub Pages 部署。
+# 托盘菜单里"Web 配置工具"打开的地址。留空则用仓库自带的 GitHub Pages 部署。
 # 自己部署到别处 (比如 Cloudflare Pages) 时改这里。
 # web_url = "https://my-keyremap.pages.dev/"
 
 # 单键映射: from = "..." / to = "..."
 # 组合键映射: to 写成数组, 例如 to = ["Ctrl", "W"]
 #
-# 用 `keyremap-ng --listen` 查看按下的键叫什么名字 (托盘菜单里也有入口)。
-# 用 `keyremap-ng --dump-keys` 列出全部可用键名。
+# 用 `keyremap --listen` 查看按下的键叫什么名字 (托盘菜单里也有入口)。
+# 用 `keyremap --dump-keys` 列出全部可用键名。
 
 # 组开关。整段可选 —— 这里没列出的组默认启用,
 # 所以只想分组、不想预设开关时可以完全不写这一段。

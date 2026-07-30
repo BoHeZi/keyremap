@@ -1,163 +1,217 @@
-//! 开机自启动, 通过 HKCU 的 Run 注册表项实现。
+//! 开机自启动。
 //!
-//! 用 HKCU 而不是 HKLM: 前者不需要管理员权限, 且只影响当前用户 —— 键盘映射
-//! 本来就是个人偏好。代价是这样启动的进程**不会提权**, 想要"开机自启且以管理员运行"
-//! 得走任务计划程序, 见 [`elevate`](crate::elevate) 里的说明。
+//! 有两种机制, 用哪个取决于"是否以管理员身份运行"这个偏好:
+//!
+//! - **普通权限**: `HKCU\...\Run` 项。简单, 不需要任何特权。
+//! - **管理员**:   任务计划程序里一个 `/RL HIGHEST` 的登录触发任务。
+//!
+//! 为什么管理员模式必须换机制: `HKCU\Run` 启动的进程**永远不会提权**,
+//! 这是 Windows 的设计。想要"开机自启 + 管理员"只有计划任务这一条路。
+//!
+//! 两种机制互斥, 切换时必须清掉另一个 —— 否则会有两条自启路径同时生效。
+//! (虽然单实例锁会挡掉第二个进程, 但那是靠巧合而不是设计。)
 
+use std::os::windows::process::CommandExt;
 use std::path::Path;
-use std::ptr;
+use std::process::Command;
 
-use windows_sys::Win32::Foundation::ERROR_SUCCESS;
-use windows_sys::Win32::System::Registry::{
-    HKEY, HKEY_CURRENT_USER, KEY_QUERY_VALUE, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW,
-    RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
-};
+use log::debug;
+use windows_sys::Win32::System::Registry::HKEY_CURRENT_USER;
+
+use crate::{elevate, regutil, singleton};
 
 const RUN_KEY: &str = r"Software\Microsoft\Windows\CurrentVersion\Run";
-const VALUE_NAME: &str = "keyremap-ng";
+const RUN_VALUE: &str = "keyremap";
 
-/// 当前是否已设置为开机自启。
-///
-/// 不只看键存不存在, 还要确认它指向的是**当前这个 exe**: 用户可能有多份副本,
-/// 注册表里那条如果指向另一份, 对本实例来说就不算"已启用"。
+/// 不让 schtasks 闪出一个控制台窗口 —— 本程序是 GUI 子系统的。
+const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+/// 计划任务名。带上 exe 路径的哈希, 这样复制到别处的另一份副本
+/// 可以有自己的自启任务, 和单实例锁的粒度保持一致。
+fn task_name() -> String {
+    singleton::name_for_current_exe()
+}
+
+/// 当前是否已设置开机自启 (两种机制任一生效即算)。
 pub fn is_enabled() -> bool {
-    let Some(current) = command_line() else {
+    run_entry_is_self() || task_exists()
+}
+
+/// 按当前的管理员偏好启用自启。
+///
+/// 会顺手清掉另一种机制, 所以也可以当"切换机制"用。
+pub fn enable(config_path: &Path) -> Result<(), String> {
+    if elevate::wants_admin() {
+        // 鸡生蛋: 创建 /RL HIGHEST 的任务本身就需要管理员权限
+        if !elevate::is_elevated() {
+            return Err("创建管理员级别的自启任务需要先以管理员身份运行".into());
+        }
+        remove_run_entry()?;
+        create_task(config_path)
+    } else {
+        delete_task_quiet();
+        write_run_entry(config_path)
+    }
+}
+
+/// 关闭自启, 两种机制都清掉。
+pub fn disable() -> Result<(), String> {
+    let r = remove_run_entry();
+    delete_task_quiet();
+    r
+}
+
+/// 让实际使用的机制与当前偏好一致。启动时调用一次, 幂等。
+///
+/// 用途: 用户刚打开"以管理员运行"时还没有权限建任务, 提权重启之后
+/// 由这里补上, 并把旧的 Run 项清掉。
+pub fn sync(config_path: &Path) -> Result<(), String> {
+    if !is_enabled() {
+        return Ok(());
+    }
+    let admin_mode = elevate::wants_admin();
+    let via_task = task_exists();
+
+    // 已经在正确的机制上, 什么都不用做
+    if admin_mode == via_task {
+        return Ok(());
+    }
+    debug!(
+        "自启机制需要切换: 当前={}, 期望={}",
+        if via_task { "计划任务" } else { "Run 项" },
+        if admin_mode {
+            "计划任务"
+        } else {
+            "Run 项"
+        }
+    );
+    enable(config_path)
+}
+
+// ---------- HKCU\Run ----------
+
+/// Run 项存在且指向**当前这个 exe**。
+///
+/// 不只看键是否存在: 用户可能有多份副本, 注册表里那条若指向另一份,
+/// 对本实例来说就不算"已启用"。
+fn run_entry_is_self() -> bool {
+    let Some(existing) = regutil::read_string(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE) else {
         return false;
     };
-    match read_value() {
-        Some(existing) => paths_equal(&existing, &current),
-        None => false,
-    }
-}
-
-/// 开启自启动。写入的命令包含配置文件路径, 保证开机后加载的是同一份配置。
-pub fn enable(config_path: &Path) -> Result<(), String> {
-    let cmd = command_line_with(config_path).ok_or("无法确定程序路径")?;
-    write_value(&cmd)
-}
-
-/// 关闭自启动。
-pub fn disable() -> Result<(), String> {
-    delete_value()
-}
-
-/// 当前 exe 的启动命令 (不带配置参数), 用于比对。
-fn command_line() -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    Some(format!("\"{}\"", exe.display()))
-}
-
-fn command_line_with(config_path: &Path) -> Option<String> {
-    let exe = std::env::current_exe().ok()?;
-    Some(format!(
-        "\"{}\" -c \"{}\"",
-        exe.display(),
-        config_path.display()
-    ))
-}
-
-/// 比较注册表里的命令行是否指向当前 exe。
-/// 注册表里的值带着 `-c` 参数, 所以只比较开头的可执行文件部分, 且忽略大小写。
-fn paths_equal(registered: &str, current_prefix: &str) -> bool {
-    registered
-        .to_lowercase()
-        .starts_with(&current_prefix.to_lowercase())
-}
-
-// ---------- 注册表读写 ----------
-
-fn wide(s: &str) -> Vec<u16> {
-    s.encode_utf16().chain(std::iter::once(0)).collect()
-}
-
-fn open_run_key(access: u32) -> Option<HKEY> {
-    let sub = wide(RUN_KEY);
-    let mut key: HKEY = ptr::null_mut();
-    let rc = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, sub.as_ptr(), 0, access, &mut key) };
-    if rc == ERROR_SUCCESS { Some(key) } else { None }
-}
-
-fn read_value() -> Option<String> {
-    let key = open_run_key(KEY_QUERY_VALUE)?;
-    let name = wide(VALUE_NAME);
-    let mut buf = [0u16; 1024];
-    let mut size = (buf.len() * 2) as u32;
-
-    let rc = unsafe {
-        RegQueryValueExW(
-            key,
-            name.as_ptr(),
-            ptr::null(),
-            ptr::null_mut(),
-            buf.as_mut_ptr() as *mut u8,
-            &mut size,
-        )
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
     };
-    unsafe { RegCloseKey(key) };
-
-    if rc != ERROR_SUCCESS {
-        return None;
-    }
-    // size 是字节数, 且包含结尾的 NUL
-    let len = (size as usize / 2).saturating_sub(1);
-    Some(String::from_utf16_lossy(&buf[..len.min(buf.len())]))
+    let prefix = format!("\"{}\"", exe.display()).to_lowercase();
+    existing.to_lowercase().starts_with(&prefix)
 }
 
-fn write_value(cmd: &str) -> Result<(), String> {
-    let key = open_run_key(KEY_SET_VALUE).ok_or("无法打开注册表 Run 项")?;
-    let name = wide(VALUE_NAME);
-    let data = wide(cmd);
+fn write_run_entry(config_path: &Path) -> Result<(), String> {
+    let cmd = launch_command(config_path)?;
+    regutil::write_string(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE, &cmd)
+}
 
-    let rc = unsafe {
-        RegSetValueExW(
-            key,
-            name.as_ptr(),
-            0,
-            REG_SZ,
-            data.as_ptr() as *const u8,
-            (data.len() * 2) as u32,
-        )
-    };
-    unsafe { RegCloseKey(key) };
+fn remove_run_entry() -> Result<(), String> {
+    regutil::delete_value(HKEY_CURRENT_USER, RUN_KEY, RUN_VALUE)
+}
 
-    if rc == ERROR_SUCCESS {
-        Ok(())
-    } else {
-        Err(format!("写入注册表失败, 错误码 {rc}"))
+// ---------- 任务计划程序 ----------
+
+fn task_exists() -> bool {
+    schtasks(&["/Query", "/TN", &task_name()]).is_ok()
+}
+
+fn create_task(config_path: &Path) -> Result<(), String> {
+    let cmd = launch_command(config_path)?;
+    schtasks(&[
+        "/Create",
+        "/F", // 已存在则覆盖
+        "/TN",
+        &task_name(),
+        "/TR",
+        &cmd,
+        "/SC",
+        "ONLOGON",
+        "/RL",
+        "HIGHEST", // 关键: 以最高可用权限运行, 开机自启时不弹 UAC
+    ])
+    .map(|_| ())
+    .map_err(|e| format!("创建自启任务失败: {e}"))
+}
+
+/// 删除任务, 失败只记日志。任务本来不存在也会"失败", 那不算问题。
+fn delete_task_quiet() {
+    if let Err(e) = schtasks(&["/Delete", "/F", "/TN", &task_name()]) {
+        debug!("删除自启任务未成功 (可能本来就没有): {e}");
     }
 }
 
-fn delete_value() -> Result<(), String> {
-    let key = open_run_key(KEY_SET_VALUE).ok_or("无法打开注册表 Run 项")?;
-    let name = wide(VALUE_NAME);
-    let rc = unsafe { RegDeleteValueW(key, name.as_ptr()) };
-    unsafe { RegCloseKey(key) };
+fn schtasks(args: &[&str]) -> Result<String, String> {
+    let out = Command::new("schtasks")
+        .args(args)
+        .creation_flags(CREATE_NO_WINDOW)
+        .output()
+        .map_err(|e| format!("无法调用 schtasks: {e}"))?;
 
-    // 本来就没有也算成功
-    if rc == ERROR_SUCCESS || rc == 2 {
-        Ok(())
+    if out.status.success() {
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     } else {
-        Err(format!("删除注册表项失败, 错误码 {rc}"))
+        // schtasks 的中文输出是 OEM 编码, from_utf8_lossy 可能出乱码,
+        // 但错误信息只进日志, 够用
+        let msg = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        Err(if msg.is_empty() {
+            format!("schtasks 退出码 {:?}", out.status.code())
+        } else {
+            msg
+        })
     }
+}
+
+// ---------- 公共 ----------
+
+/// 自启时使用的命令行。
+///
+/// 配置就在 exe 同目录且用默认名时不带 `-c`, 命令行更短也更不容易出错
+/// (schtasks 的 /TR 对嵌套引号比较敏感)。
+fn launch_command(config_path: &Path) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|e| format!("无法确定程序路径: {e}"))?;
+    let default = exe.parent().map(|d| d.join("keyremap.toml"));
+
+    Ok(if default.as_deref() == Some(config_path) {
+        format!("\"{}\"", exe.display())
+    } else {
+        format!("\"{}\" -c \"{}\"", exe.display(), config_path.display())
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     #[test]
-    fn 命令行前缀比对忽略大小写() {
-        assert!(paths_equal(
-            r#""D:\App\Keyremap-NG.exe" -c "D:\App\keyremap.toml""#,
-            r#""d:\app\keyremap-ng.exe""#
-        ));
+    fn 默认配置路径不带参数() {
+        // 只能间接验证: 默认名与非默认名产生的命令长度不同
+        let exe = std::env::current_exe().unwrap();
+        let default = exe.parent().unwrap().join("keyremap.toml");
+        let cmd = launch_command(&default).unwrap();
+        assert!(!cmd.contains("-c"), "默认路径不该带 -c: {cmd}");
+        assert!(cmd.starts_with('"') && cmd.ends_with('"'));
     }
 
     #[test]
-    fn 指向别处的自启项不算已启用() {
-        assert!(!paths_equal(
-            r#""C:\Other\keyremap-ng.exe" -c "x.toml""#,
-            r#""d:\app\keyremap-ng.exe""#
-        ));
+    fn 非默认配置路径带上参数() {
+        let other = PathBuf::from(r"D:\somewhere\my.toml");
+        let cmd = launch_command(&other).unwrap();
+        assert!(cmd.contains("-c"), "非默认路径应带 -c: {cmd}");
+        assert!(cmd.contains("my.toml"));
+        // 路径两侧都要有引号, 否则含空格的路径会被拆开
+        assert!(cmd.contains(r#""D:\somewhere\my.toml""#));
+    }
+
+    #[test]
+    fn 任务名与单实例锁同源() {
+        // 两者都按 exe 路径区分, 保证多副本行为一致
+        assert_eq!(task_name(), singleton::name_for_current_exe());
+        assert!(task_name().starts_with("keyremap-"));
     }
 }

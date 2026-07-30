@@ -95,7 +95,7 @@ pub fn init(config_path: &Path) -> Result<(), String> {
 
     unsafe {
         let hinst = GetModuleHandleW(ptr::null());
-        let class_name = wide("keyremap_ng_tray_window");
+        let class_name = wide("keyremap_tray_window");
 
         let class = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
@@ -113,7 +113,7 @@ pub fn init(config_path: &Path) -> Result<(), String> {
         let hwnd = CreateWindowExW(
             0,
             class_name.as_ptr(),
-            wide("keyremap-ng").as_ptr(),
+            wide("keyremap").as_ptr(),
             0,
             0,
             0,
@@ -199,12 +199,19 @@ fn status_text() -> String {
     let n = hook::config_snapshot()
         .map(|c| c.active_count())
         .unwrap_or(0);
+    // 带上当前实际权限: 菜单里的勾选反映的是"偏好", 这里反映的是"此刻是否真的
+    // 以管理员在跑" —— 两者可以不一致 (刚改完偏好还没重启时就是)。
     format!(
-        "keyremap-ng — {} ({n} 条映射生效)",
+        "keyremap — {} ({n} 条映射生效){}",
         if hook::is_enabled() {
             "已启用"
         } else {
             "已禁用"
+        },
+        if elevate::is_elevated() {
+            " · 管理员"
+        } else {
+            ""
         }
     )
 }
@@ -270,7 +277,7 @@ unsafe fn show_menu(hwnd: HWND) {
             (ID_RELOAD, "重新加载配置"),
             (ID_OPEN_FILE, "打开配置文件"),
             (ID_OPEN_DIR, "打开配置目录"),
-            (ID_WEB_TOOL, "图形配置工具..."),
+            (ID_WEB_TOOL, "Web 配置工具..."),
         ] {
             let w = wide(text);
             AppendMenuW(menu, MF_STRING, id as usize, w.as_ptr());
@@ -285,14 +292,15 @@ unsafe fn show_menu(hwnd: HWND) {
             autorun.as_ptr(),
         );
 
-        // 已经是管理员时没什么可做的, 显示成灰色状态项
-        if elevate::is_elevated() {
-            let t = wide("已以管理员身份运行");
-            AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, t.as_ptr());
-        } else {
-            let t = wide("以管理员身份重启");
-            AppendMenuW(menu, MF_STRING, ID_RUNAS as usize, t.as_ptr());
-        }
+        // 这是个持久化偏好而非一次性动作, 所以做成勾选项:
+        // 打开后手动启动与开机自启都会以管理员身份运行。
+        let runas = wide("以管理员身份启动");
+        AppendMenuW(
+            menu,
+            item_flags(elevate::wants_admin()),
+            ID_RUNAS as usize,
+            runas.as_ptr(),
+        );
 
         AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
         let quit = wide("退出");
@@ -462,6 +470,60 @@ fn open_web_tool() {
     }
 }
 
+/// 切换"以管理员身份启动"这个持久化偏好。
+///
+/// 打开时如果当前还不是管理员, 得先提权重启 —— 创建 /RL HIGHEST 的自启任务
+/// 本身就需要管理员权限, 这个鸡生蛋只能靠换进程解开。重启后 main 里的
+/// `autostart::sync` 会把自启机制补成计划任务。
+fn toggle_run_as_admin() {
+    let turn_on = !elevate::wants_admin();
+
+    if let Err(e) = elevate::set_wants_admin(turn_on) {
+        error!("保存管理员偏好失败: {e}");
+        notify("设置失败", &e);
+        return;
+    }
+
+    if turn_on && !elevate::is_elevated() {
+        info!("已记下管理员偏好, 需要提权重启才能生效");
+        notify("即将以管理员身份重启", "请在 UAC 确认框里允许");
+        // 只置标记, 真正的重启在 main 里做 —— 那时单实例锁已经释放
+        RESTART_AS_ADMIN.store(true, Ordering::SeqCst);
+        unsafe { PostQuitMessage(0) };
+        return;
+    }
+
+    // 已有权限(或是关闭偏好), 直接把自启机制落实到位
+    apply_autostart_for_current_pref(if turn_on {
+        "已开启: 以后启动都会请求管理员权限"
+    } else {
+        "已关闭: 下次启动起以普通权限运行"
+    });
+    update_status();
+}
+
+/// 按当前偏好重新落实自启机制。没开自启就什么都不用做。
+fn apply_autostart_for_current_pref(msg: &str) {
+    if !autostart::is_enabled() {
+        notify("keyremap", msg);
+        return;
+    }
+    let Some(path) = CONFIG_PATH.get() else {
+        return;
+    };
+    // enable 内部会按偏好在 Run 项与计划任务之间选一个, 并清掉另一个
+    match autostart::enable(path) {
+        Ok(()) => {
+            info!("{msg}");
+            notify("keyremap", msg);
+        }
+        Err(e) => {
+            error!("调整自启机制失败: {e}");
+            notify("自启设置失败", &e);
+        }
+    }
+}
+
 fn toggle_autostart() {
     let turn_on = !autostart::is_enabled();
     let result = match CONFIG_PATH.get() {
@@ -478,7 +540,7 @@ fn toggle_autostart() {
                 "已取消开机自启动"
             };
             info!("{msg}");
-            notify("keyremap-ng", msg);
+            notify("keyremap", msg);
         }
         Err(e) => {
             error!("设置自启动失败: {e}");
@@ -509,7 +571,7 @@ fn handle_command(id: u32) {
             hook::set_enabled(on);
             update_status();
             notify(
-                "keyremap-ng",
+                "keyremap",
                 if on {
                     "映射已启用"
                 } else {
@@ -545,11 +607,7 @@ fn handle_command(id: u32) {
         ID_LISTEN => spawn_listen(),
         ID_WEB_TOOL => open_web_tool(),
         ID_AUTOSTART => toggle_autostart(),
-        ID_RUNAS => {
-            // 只置标记, 真正的重启在 main 里做 —— 那时单实例锁已经释放
-            RESTART_AS_ADMIN.store(true, Ordering::SeqCst);
-            unsafe { PostQuitMessage(0) };
-        }
+        ID_RUNAS => toggle_run_as_admin(),
         ID_QUIT => {
             info!("退出");
             unsafe { PostQuitMessage(0) };
@@ -564,7 +622,7 @@ fn handle_command(id: u32) {
                 let state = if now { "启用" } else { "禁用" };
                 info!("组 {name} 已{state}");
                 update_status();
-                notify("keyremap-ng", &format!("组「{name}」已{state}"));
+                notify("keyremap", &format!("组「{name}」已{state}"));
             }
         }
         id if id >= ID_MAPPING_BASE => {

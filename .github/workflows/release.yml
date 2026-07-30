@@ -30,9 +30,9 @@ jobs:
       - name: Package
         shell: pwsh
         run: |
-          $name = "keyremap-ng-${{ github.ref_name }}-windows-x64"
+          $name = "keyremap-${{ github.ref_name }}-windows-x64"
           New-Item -ItemType Directory -Path $name | Out-Null
-          Copy-Item target\release\keyremap-ng.exe,keyremap.toml,README.md,LICENSE -Destination $name
+          Copy-Item target\release\keyremap.exe,keyremap.toml,README.md,LICENSE -Destination $name
           Compress-Archive -Path $name -DestinationPath "$name.zip"
           Get-ChildItem "$name.zip"
 

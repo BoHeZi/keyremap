@@ -1,6 +1,6 @@
 'use strict';
 
-// keyremap-ng 配置工具。纯静态、无构建步骤，只依赖同目录下的 Alpine.js。
+// keyremap 配置工具。纯静态、无构建步骤，只依赖同目录下的 Alpine.js。
 //
 // 两种工作方式:
 //   整文件模式 —— File System Access API 直接读写 keyremap.toml，
@@ -54,7 +54,7 @@ const CODE_MAP = (() => {
 })();
 
 const DEFAULT_HEADER =
-  '# keyremap-ng 配置\n# 用 keyremap-ng --dump-keys 可以列出全部可用键名';
+  '# keyremap 配置\n# 用 keyremap --dump-keys 可以列出全部可用键名';
 
 // ---------- TOML 解析 ----------
 
@@ -178,7 +178,7 @@ function newMapping() {
 
 // ---------- 文件句柄的持久化 ----------
 
-const IDB_NAME = 'keyremap-ng';
+const IDB_NAME = 'keyremap';
 const IDB_STORE = 'handles';
 
 function openIdb() {

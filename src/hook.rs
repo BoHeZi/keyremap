@@ -71,16 +71,35 @@ pub fn config_snapshot() -> Option<Arc<Config>> {
 /// 用 copy-on-write 整体替换 Arc, 而不是原地改 —— 这样钩子回调侧永远
 /// 看到的是一个完整一致的配置, 不需要在热路径上加写锁。
 pub fn toggle_mapping(index: usize) -> Option<bool> {
+    update_config(|cfg| {
+        let m = cfg.mappings.get_mut(index)?;
+        m.enable = !m.enable;
+        Some(m.enable)
+    })
+}
+
+/// 切换整组的启用状态, 返回切换后的值。组关掉时组内所有映射一并停止生效。
+pub fn toggle_group(index: usize) -> Option<bool> {
+    update_config(|cfg| {
+        let g = cfg.groups.get_mut(index)?;
+        g.enable = !g.enable;
+        Some(g.enable)
+    })
+}
+
+/// 以 copy-on-write 的方式修改配置。
+///
+/// 整体替换 Arc 而不是原地改 —— 这样钩子回调侧永远看到一个完整一致的配置,
+/// 不需要在热路径上加写锁。配置很小, 克隆的代价远低于让回调等锁。
+fn update_config<T>(f: impl FnOnce(&mut Config) -> Option<T>) -> Option<T> {
     let cell = CONFIG.get()?;
     let mut guard = cell.write().ok()?;
 
     let mut next = (**guard).clone();
-    let m = next.mappings.get_mut(index)?;
-    m.enable = !m.enable;
-    let now = m.enable;
+    let result = f(&mut next)?;
 
     *guard = Arc::new(next);
-    Some(now)
+    Some(result)
 }
 
 pub fn set_enabled(on: bool) {
@@ -124,7 +143,8 @@ fn dispatch(input: Input, is_down: bool) -> bool {
     };
 
     for m in &config.mappings {
-        if !m.enable || m.from != input {
+        // is_active 同时看映射自身的开关和所属组的开关, 只是一次数组索引
+        if m.from != input || !config.is_active(m) {
             continue;
         }
 

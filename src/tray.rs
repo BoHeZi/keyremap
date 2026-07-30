@@ -54,6 +54,8 @@ const ID_LISTEN: u32 = 6;
 const ID_AUTOSTART: u32 = 7;
 const ID_RUNAS: u32 = 8;
 const ID_MAPPING_BASE: u32 = 100;
+/// 组开关的 ID 起点。取得比映射区间高很多, 免得两者撞上。
+const ID_GROUP_BASE: u32 = 10000;
 
 /// 退出时是否要以管理员身份重启。
 ///
@@ -174,7 +176,7 @@ pub fn notify(title: &str, message: &str) {
 
 fn status_text() -> String {
     let n = hook::config_snapshot()
-        .map(|c| c.enabled_count())
+        .map(|c| c.active_count())
         .unwrap_or(0);
     format!(
         "keyremap-ng — {} ({n} 条映射生效)",
@@ -300,16 +302,23 @@ fn item_flags(checked: bool) -> u32 {
     }
 }
 
-/// 把逐条映射的开关挂成子菜单。
+/// 把映射开关挂成子菜单, 按组分区。
 ///
-/// 映射条数是随配置增长的, 全摊在一级菜单里会让菜单越来越长, 而且"退出"这类
+/// 映射条数随配置增长, 全摊在一级菜单里会让菜单越来越长, 而且"退出"这类
 /// 常用项的位置会随配置数量上下漂移。收进子菜单后一级菜单的结构就固定了。
+///
+/// 组内布局: 组标题本身就是组开关, 紧随其后是缩进显示的组内映射。
+/// 组被关掉时组内各项一并置灰 —— 此时逐条开关没有意义, 灰掉比让人点了
+/// 没反应更清楚。
 unsafe fn append_mapping_submenu(parent: HMENU) {
-    let cfg = hook::config_snapshot();
-    let mappings = cfg.as_ref().map(|c| c.mappings.as_slice()).unwrap_or(&[]);
+    let Some(cfg) = hook::config_snapshot() else {
+        let text = wide("映射设置 (未加载)");
+        unsafe { AppendMenuW(parent, MF_STRING | MF_GRAYED, 0, text.as_ptr()) };
+        return;
+    };
 
-    if mappings.is_empty() {
-        let text = wide("映射开关 (无配置)");
+    if cfg.mappings.is_empty() {
+        let text = wide("映射设置 (无配置)");
         unsafe { AppendMenuW(parent, MF_STRING | MF_GRAYED, 0, text.as_ptr()) };
         return;
     }
@@ -320,19 +329,51 @@ unsafe fn append_mapping_submenu(parent: HMENU) {
         return;
     }
 
+    // 只有"未分组"这一个组时不显示组标题: 没用分组的配置不该被塞进一层
+    // 无意义的层次里。
+    let flat = cfg.groups.len() == 1 && cfg.groups[0].name.is_empty();
+
     unsafe {
-        for (i, m) in mappings.iter().enumerate() {
-            let w = wide(&m.label());
-            AppendMenuW(
-                sub,
-                item_flags(m.enable),
-                (ID_MAPPING_BASE + i as u32) as usize,
-                w.as_ptr(),
-            );
+        for (gi, g) in cfg.groups.iter().enumerate() {
+            if !flat {
+                if gi > 0 {
+                    AppendMenuW(sub, MF_SEPARATOR, 0, ptr::null());
+                }
+                let (on, total) = cfg.group_counts(gi);
+                let title = wide(&format!("【{}】  {on}/{total}", g.display_name()));
+                AppendMenuW(
+                    sub,
+                    item_flags(g.enable),
+                    (ID_GROUP_BASE + gi as u32) as usize,
+                    title.as_ptr(),
+                );
+            }
+
+            for (mi, m) in cfg.mappings_in_group(gi) {
+                let mut flags = item_flags(m.enable);
+                if !g.enable {
+                    flags |= MF_GRAYED;
+                }
+                // 缩进以表示归属关系
+                let text = wide(&if flat {
+                    m.label()
+                } else {
+                    format!("    {}", m.label())
+                });
+                AppendMenuW(
+                    sub,
+                    flags,
+                    (ID_MAPPING_BASE + mi as u32) as usize,
+                    text.as_ptr(),
+                );
+            }
         }
 
-        let on = mappings.iter().filter(|m| m.enable).count();
-        let title = wide(&format!("映射开关 ({on}/{})", mappings.len()));
+        let title = wide(&format!(
+            "映射设置 ({}/{})",
+            cfg.active_count(),
+            cfg.mappings.len()
+        ));
         // MF_POPUP 时第三个参数是子菜单句柄而非命令 ID。
         // 父菜单 DestroyMenu 时会连带销毁子菜单, 不用单独释放。
         AppendMenuW(parent, MF_POPUP | MF_STRING, sub as usize, title.as_ptr());
@@ -457,6 +498,19 @@ fn handle_command(id: u32) {
         ID_QUIT => {
             info!("退出");
             unsafe { PostQuitMessage(0) };
+        }
+        // 组开关的区间在映射之上, 必须先判断
+        id if id >= ID_GROUP_BASE => {
+            let idx = (id - ID_GROUP_BASE) as usize;
+            if let Some(now) = hook::toggle_group(idx) {
+                let name = hook::config_snapshot()
+                    .and_then(|c| c.groups.get(idx).map(|g| g.display_name().to_string()))
+                    .unwrap_or_default();
+                let state = if now { "启用" } else { "禁用" };
+                info!("组 {name} 已{state}");
+                update_status();
+                notify("keyremap-ng", &format!("组「{name}」已{state}"));
+            }
         }
         id if id >= ID_MAPPING_BASE => {
             let idx = (id - ID_MAPPING_BASE) as usize;

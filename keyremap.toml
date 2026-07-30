@@ -1,10 +1,18 @@
 name = "默认配置"
 
-# 单键映射: 写成 from = "..." / to = "..."
+# 单键映射: from = "..." / to = "..."
 # 组合键映射: to 写成数组, 例如 to = ["Ctrl", "W"]
 #
-# 用 `keyremap-ng --listen` 可以查看按下的键叫什么名字。
-# 用 `keyremap-ng --dump-keys` 可以列出全部可用键名。
+# 用 `keyremap-ng --listen` 查看按下的键叫什么名字 (托盘菜单里也有入口)。
+# 用 `keyremap-ng --dump-keys` 列出全部可用键名。
+
+# 组开关。整段可选 —— 这里没列出的组默认启用,
+# 所以只想分组、不想预设开关时可以完全不写这一段。
+# 托盘菜单里也能临时切换 (只改内存, 不写回本文件)。
+[groups]
+"文本编辑" = false
+
+# ---- 未分组: 不写 group 字段的映射都归到这里 ----
 
 [[mappings]]
 name = "Pause转Insert"
@@ -12,23 +20,29 @@ comment = "把不常用的 Pause 键变成 Insert"
 from = "Pause"
 to = "Insert"
 
+# ---- 组不需要预先声明, 写了 group 就有 ----
+
 [[mappings]]
-name = "鼠标侧键转Ctrl+W"
+name = "关闭标签页"
 comment = "鼠标前进键关闭当前标签页"
+group = "浏览器"
 from = "MouseX2"
 to = ["Ctrl", "W"]
 
-# 下面两条互为反向映射。两条同时启用也不会死循环:
-# 注入的按键带有标记, 钩子识别后会直接放行, 不会再次匹配。
-# (这里默认关着只是因为 D/E 互换会让打字很痛苦)
+# ---- 下面这组在上面的 [groups] 里被整组关掉了 ----
+# 托盘菜单中打开"文本编辑"组即可让组内各条一起生效
+
 [[mappings]]
 name = "D转E"
-enable = false
+group = "文本编辑"
 from = "D"
 to = "E"
 
 [[mappings]]
 name = "E转D"
-enable = false
+group = "文本编辑"
 from = "E"
 to = "D"
+
+# 上面两条互为反向映射, 同时启用也不会死循环:
+# 注入的按键带有标记, 钩子识别后会直接放行, 不会再次匹配。

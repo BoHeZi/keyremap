@@ -130,19 +130,7 @@ fn main() {
     };
 
     if args.dump {
-        let mut text = format!("配置名称: {}\n", cfg.name);
-        for m in &cfg.mappings {
-            text.push_str(&format!(
-                "  [{}] {:<20} {}\n",
-                if m.enable { "on " } else { "off" },
-                m.name,
-                m
-            ));
-            if !m.comment.is_empty() {
-                text.push_str(&format!("        {}\n", m.comment));
-            }
-        }
-        emit(text.trim_end(), args.output.as_deref());
+        emit(&dump_text(&cfg), args.output.as_deref());
         return;
     }
 
@@ -164,7 +152,7 @@ fn main() {
     let with_mouse = cfg.needs_mouse_hook();
     info!(
         "已启用 {} 条映射{}",
-        cfg.enabled_count(),
+        cfg.active_count(),
         if with_mouse { " (含鼠标)" } else { "" }
     );
     for m in cfg.mappings.iter().filter(|m| m.enable) {
@@ -207,6 +195,45 @@ fn main() {
         info!("正在以管理员身份重启");
         elevate::restart_as_admin(&config_path);
     }
+}
+
+/// 按组列出配置。
+///
+/// 状态列反映的是**实际是否生效**而不只是映射自身的开关: 一条自身启用、
+/// 但所属组被关掉的映射并不工作, 标成 on 会造成误导。
+fn dump_text(cfg: &config::Config) -> String {
+    let mut text = format!("配置名称: {}\n", cfg.name);
+    text.push_str(&format!(
+        "生效 {}/{} 条\n",
+        cfg.active_count(),
+        cfg.mappings.len()
+    ));
+
+    for (gi, g) in cfg.groups.iter().enumerate() {
+        let (on, total) = cfg.group_counts(gi);
+        text.push_str(&format!(
+            "\n【{}】  {on}/{total}{}\n",
+            g.display_name(),
+            if g.enable { "" } else { "  (整组已禁用)" }
+        ));
+
+        for (_, m) in cfg.mappings_in_group(gi) {
+            let state = if cfg.is_active(m) {
+                "on "
+            } else if !m.enable {
+                "off"
+            } else {
+                // 自身开着但组关着
+                "grp"
+            };
+            text.push_str(&format!("  [{state}] {:<20} {m}\n", m.name));
+            if !m.comment.is_empty() {
+                text.push_str(&format!("        {}\n", m.comment));
+            }
+        }
+    }
+    text.push_str("\n状态: on=生效  off=该条已关闭  grp=所属组已关闭");
+    text
 }
 
 /// 把文本输出到文件或控制台。
@@ -291,7 +318,7 @@ fn run_app_loop() {
 
 fn tray_reload_text() -> String {
     let n = hook::config_snapshot()
-        .map(|c| c.enabled_count())
+        .map(|c| c.active_count())
         .unwrap_or(0);
     format!("{n} 条映射生效")
 }

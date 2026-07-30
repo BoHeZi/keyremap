@@ -1,9 +1,11 @@
 //! 配置的解析与"编译"。
 //!
 //! 配置文件里写的是键名字符串, 但钩子回调是全系统按键的必经之路,
-//! 绝不能在那里做字符串比较。所以加载时一次性把键名解析成虚拟键码,
-//! 运行期只比较整数。键名写错也在这一步就报出来, 而不是等到按下才失败。
+//! 绝不能在那里做字符串比较。所以加载时一次性把键名解析成虚拟键码、
+//! 把组名解析成索引, 运行期只比较整数。键名写错也在这一步就报出来,
+//! 而不是等到按下才失败。
 
+use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
@@ -12,12 +14,19 @@ use serde::Deserialize;
 use crate::inject::MAX_COMBO;
 use crate::keycode::{Input, input_from_name, name_from_mouse, name_from_vk, vk_from_name};
 
+/// 未分组映射在菜单里显示的名字。
+pub const UNGROUPED_LABEL: &str = "未分组";
+
 // ---------- 文件里的原始结构 ----------
 
 #[derive(Debug, Deserialize)]
 struct RawConfig {
     #[serde(default)]
     name: String,
+    /// 组的启用状态, 整段可选。没列出的组默认启用,
+    /// 所以只想分组、不想预设开关时可以完全不写这一段。
+    #[serde(default)]
+    groups: HashMap<String, bool>,
     #[serde(default)]
     mappings: Vec<RawMapping>,
 }
@@ -30,6 +39,9 @@ struct RawMapping {
     comment: String,
     #[serde(default = "default_true")]
     enable: bool,
+    /// 所属组, 不写则归入未分组。组不需要预先声明。
+    #[serde(default)]
+    group: String,
     from: String,
     to: RawOutput,
 }
@@ -48,19 +60,41 @@ fn default_true() -> bool {
 
 // ---------- 编译后的运行期结构 ----------
 
-/// 一条编译好的映射。热路径上只会读 `enable` / `from` / `to`。
+/// 一个映射组。组的顺序由映射中首次出现的次序决定。
+#[derive(Debug, Clone)]
+pub struct Group {
+    /// 组名。空字符串代表"未分组"。
+    pub name: String,
+    pub enable: bool,
+}
+
+impl Group {
+    /// 菜单里显示的名字, 未分组显示成固定文案。
+    pub fn display_name(&self) -> &str {
+        if self.name.is_empty() {
+            UNGROUPED_LABEL
+        } else {
+            &self.name
+        }
+    }
+}
+
+/// 一条编译好的映射。热路径上只会读 `enable` / `group` / `from` / `to`。
 #[derive(Debug, Clone)]
 pub struct Mapping {
     pub name: String,
     pub comment: String,
     pub enable: bool,
+    /// 所属组在 [`Config::groups`] 中的下标。
+    /// 存索引而不是组名: 钩子回调里不能做字符串比较。
+    pub group: usize,
     pub from: Input,
     /// 目标按键序列。长度为 1 表示单键映射, 大于 1 表示组合键。
     pub to: Vec<u16>,
 }
 
 impl Mapping {
-    /// 是否是组合键映射。单键与组合键的触发时机不同, 见 `hook::handle`。
+    /// 是否是组合键映射。单键与组合键的触发时机不同, 见 `hook::dispatch`。
     pub fn is_combo(&self) -> bool {
         self.to.len() > 1
     }
@@ -94,16 +128,24 @@ impl fmt::Display for Mapping {
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     pub name: String,
+    pub groups: Vec<Group>,
     pub mappings: Vec<Mapping>,
 }
 
 impl Config {
+    /// 这条映射当前是否真正生效: 自身启用**且**所属组也启用。
+    ///
+    /// 热路径上调用, 所以是一次数组索引而非字符串查找。
+    pub fn is_active(&self, m: &Mapping) -> bool {
+        m.enable && self.groups.get(m.group).map(|g| g.enable).unwrap_or(true)
+    }
+
     /// 配置里是否存在鼠标映射。
     ///
     /// 没有的话就不安装鼠标钩子 —— `WH_MOUSE_LL` 会收到全部鼠标移动事件,
     /// 鼠标动一下就进一次回调, 这是常态下最大的一笔无谓开销。
     ///
-    /// 注意这里**不看 enable**: 托盘菜单可以随时把某条鼠标映射打开,
+    /// 注意这里**不看启用状态**: 托盘菜单可以随时把某条鼠标映射或整个组打开,
     /// 若按启用状态决定是否装钩子, 那条映射打开后会不生效。
     pub fn needs_mouse_hook(&self) -> bool {
         self.mappings
@@ -111,8 +153,28 @@ impl Config {
             .any(|m| matches!(m.from, Input::Mouse(_)))
     }
 
-    pub fn enabled_count(&self) -> usize {
-        self.mappings.iter().filter(|m| m.enable).count()
+    /// 实际生效的映射条数。
+    pub fn active_count(&self) -> usize {
+        self.mappings.iter().filter(|m| self.is_active(m)).count()
+    }
+
+    /// 某个组内实际生效的条数与总条数, 用于菜单上的 (2/3) 这种提示。
+    pub fn group_counts(&self, index: usize) -> (usize, usize) {
+        let total = self.mappings.iter().filter(|m| m.group == index).count();
+        let on = self
+            .mappings
+            .iter()
+            .filter(|m| m.group == index && self.is_active(m))
+            .count();
+        (on, total)
+    }
+
+    /// 按组归拢映射下标, 供菜单按组分区展示。
+    pub fn mappings_in_group(&self, index: usize) -> impl Iterator<Item = (usize, &Mapping)> {
+        self.mappings
+            .iter()
+            .enumerate()
+            .filter(move |(_, m)| m.group == index)
     }
 }
 
@@ -127,7 +189,9 @@ pub fn load(path: &Path) -> Result<Config, String> {
 pub fn parse(content: &str) -> Result<Config, String> {
     let raw: RawConfig = toml::from_str(content).map_err(|e| format!("配置格式错误: {e}"))?;
 
+    let mut groups: Vec<Group> = Vec::new();
     let mut mappings = Vec::with_capacity(raw.mappings.len());
+
     for (i, rm) in raw.mappings.into_iter().enumerate() {
         // 报错时带上条目序号和名字, 方便定位是哪一条写错了
         let label = if rm.name.is_empty() {
@@ -162,10 +226,25 @@ pub fn parse(content: &str) -> Result<Config, String> {
             to.push(vk);
         }
 
+        // 组按首次出现的顺序登记, 不需要预先声明。
+        // 启用状态取 [groups] 里的设置, 没写就默认启用。
+        let group = match groups.iter().position(|g| g.name == rm.group) {
+            Some(idx) => idx,
+            None => {
+                let enable = raw.groups.get(&rm.group).copied().unwrap_or(true);
+                groups.push(Group {
+                    name: rm.group.clone(),
+                    enable,
+                });
+                groups.len() - 1
+            }
+        };
+
         mappings.push(Mapping {
             name: rm.name,
             comment: rm.comment,
             enable: rm.enable,
+            group,
             from,
             to,
         });
@@ -173,6 +252,7 @@ pub fn parse(content: &str) -> Result<Config, String> {
 
     Ok(Config {
         name: raw.name,
+        groups,
         mappings,
     })
 }
@@ -185,6 +265,9 @@ mod tests {
     const SAMPLE: &str = r#"
 name = "测试配置"
 
+[groups]
+"编辑增强" = false
+
 [[mappings]]
 name = "Pause转Insert"
 from = "Pause"
@@ -192,11 +275,18 @@ to = "Insert"
 
 [[mappings]]
 name = "侧键转Ctrl+W"
+group = "浏览器"
 from = "MouseX2"
 to = ["Ctrl", "W"]
 
 [[mappings]]
-name = "禁用项"
+name = "组内被禁用"
+group = "编辑增强"
+from = "F13"
+to = "F14"
+
+[[mappings]]
+name = "自身禁用"
 enable = false
 from = "D"
 to = "E"
@@ -205,8 +295,7 @@ to = "E"
     #[test]
     fn 解析单键与组合键() {
         let cfg = parse(SAMPLE).expect("应当解析成功");
-        assert_eq!(cfg.mappings.len(), 3);
-
+        assert_eq!(cfg.mappings.len(), 4);
         assert!(!cfg.mappings[0].is_combo());
         assert!(cfg.mappings[1].is_combo());
         assert_eq!(cfg.mappings[1].to.len(), 2);
@@ -220,10 +309,76 @@ to = "E"
     }
 
     #[test]
-    fn 禁用项不计入启用数() {
+    fn 组按首次出现顺序登记且未分组也算一组() {
         let cfg = parse(SAMPLE).unwrap();
-        assert_eq!(cfg.enabled_count(), 2);
-        assert!(!cfg.mappings[2].enable);
+        // 第一条没写 group, 所以未分组是 0 号
+        assert_eq!(cfg.groups[0].name, "");
+        assert_eq!(cfg.groups[0].display_name(), UNGROUPED_LABEL);
+        assert_eq!(cfg.groups[1].name, "浏览器");
+        assert_eq!(cfg.groups[2].name, "编辑增强");
+    }
+
+    #[test]
+    fn 未声明的组默认启用() {
+        let cfg = parse(SAMPLE).unwrap();
+        assert!(
+            cfg.groups[1].enable,
+            "浏览器组没在 [groups] 里列出, 应默认启用"
+        );
+    }
+
+    #[test]
+    fn 组被禁用时组内映射不生效() {
+        let cfg = parse(SAMPLE).unwrap();
+        let m = &cfg.mappings[2];
+        assert!(m.enable, "映射自身是启用的");
+        assert!(!cfg.is_active(m), "但所属组被禁用, 因此不应生效");
+    }
+
+    #[test]
+    fn 生效条数同时考虑组开关与自身开关() {
+        let cfg = parse(SAMPLE).unwrap();
+        // Pause 生效; 浏览器组的生效; 编辑增强被组禁用; 第四条自身禁用
+        assert_eq!(cfg.active_count(), 2);
+    }
+
+    #[test]
+    fn 组内计数只统计本组() {
+        let cfg = parse(SAMPLE).unwrap();
+        assert_eq!(cfg.group_counts(1), (1, 1), "浏览器组 1 条且生效");
+        assert_eq!(cfg.group_counts(2), (0, 1), "编辑增强组 1 条但组被关掉");
+    }
+
+    #[test]
+    fn 无组配置照旧可用() {
+        // 完全不写 [groups] 和 group 字段, 应当和以前一样可用
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "Pause"
+to = "Insert"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.groups.len(), 1);
+        assert_eq!(cfg.active_count(), 1);
+        assert!(!cfg.needs_mouse_hook());
+    }
+
+    #[test]
+    fn 鼠标映射即使被禁用也要装钩子() {
+        // 否则托盘把它打开后会不生效
+        let cfg = parse(
+            r#"
+[[mappings]]
+enable = false
+from = "MouseX1"
+to = "Esc"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.active_count(), 0);
+        assert!(cfg.needs_mouse_hook());
     }
 
     #[test]
@@ -239,34 +394,5 @@ to = "A"
         .unwrap_err();
         assert!(err.contains("错误项"), "报错应指明是哪一条: {err}");
         assert!(err.contains("NoSuchKey"), "报错应指明是哪个键名: {err}");
-    }
-
-    #[test]
-    fn 鼠标映射即使被禁用也要装钩子() {
-        // 否则托盘把它打开后会不生效
-        let cfg = parse(
-            r#"
-[[mappings]]
-enable = false
-from = "MouseX1"
-to = "Esc"
-"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.enabled_count(), 0);
-        assert!(cfg.needs_mouse_hook());
-    }
-
-    #[test]
-    fn 无鼠标映射时不需要鼠标钩子() {
-        let cfg = parse(
-            r#"
-[[mappings]]
-from = "Pause"
-to = "Insert"
-"#,
-        )
-        .unwrap();
-        assert!(!cfg.needs_mouse_hook());
     }
 }

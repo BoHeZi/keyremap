@@ -68,4 +68,5 @@ CI 会校验 `keys.js` 与 `--dump-keys` 的输出是否一致，不一致就构
 | `style.css` | 样式，跟随系统深浅色 |
 | `keys.js` | 键名表，由主程序导出 |
 | `keys.json` | 同上的 JSON 形式，供 CI 校验 |
+| `favicon.ico` | 网页图标，与主程序托盘同源。改了 `assets/app_icon.ico` 后按下面的命令重新生成 |
 | `vendor/alpine.min.js` | Alpine.js，**故意放进仓库而不引 CDN** —— 这样能离线使用、不依赖第三方可用性、也不把访问记录暴露给 CDN |

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""从 app_icon.ico 派生托盘所需的四个图标变体。
+"""从 app_icon.ico 派生托盘所需的四个图标变体, 以及 Web 工具的网页图标。
 
 原图标是纯黑线条 + 透明背景, 所以四个变体都能程序化生成, 不损失线条质量:
 
@@ -12,20 +12,34 @@
 为什么禁用态用降低不透明度而不是画一道斜杠: 托盘图标最小只有 16x16,
 斜杠在这个尺寸下会糊成一团, 而"变淡"在深浅两种背景下都读得出来。
 
+另外还生成:
+
+    ../docs/favicon.ico   网页图标, 黑线条 + 浅色圆角底板
+
+网页图标为什么不沿用透明版: 浏览器深色标签栏是深灰的, 纯黑线条在上面基本看不见,
+和任务栏是同一个问题。但网页这边不能照搬 inv 的办法 —— `<link rel="icon">` 的
+`media` 属性 Firefox 不认, 给两个图标它会挑错那一个。加一层不透明底板就与主题
+无关了, 到哪都读得出来, 这也是绝大多数网站图标的做法。
+
 依赖 Pillow。改动图标后重新跑一次:
     python assets/make-icons.py
 """
 
 from pathlib import Path
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 ASSETS = Path(__file__).parent
 SOURCE = ASSETS / "app_icon.ico"
+FAVICON = ASSETS.parent / "docs" / "favicon.ico"
 
 # 禁用态的不透明度系数。0.35 左右在深浅背景下都还能看出形状,
 # 又足够明显地区别于启用态。
 DISABLED_ALPHA = 0.35
+
+# 网页图标底板。不用纯白: 浅色标签栏本身接近白色, 纯白底板会看不出边界,
+# 图标像是浮在半空。略微发灰能让轮廓立住。
+PLATE_COLOR = (243, 243, 243, 255)
 
 
 def load_frames(path: Path) -> dict[tuple[int, int], Image.Image]:
@@ -59,6 +73,21 @@ def recolor(im: Image.Image, rgb: tuple[int, int, int] | None, alpha_scale: floa
     return out
 
 
+def on_plate(im: Image.Image) -> Image.Image:
+    """在线条底下垫一块浅色圆角底板。
+
+    圆角半径按尺寸比例给, 但 16x16 上再小的半径也只剩两三个像素,
+    所以下限取 2 —— 再小就看不出是圆角, 再大在小尺寸上会啃掉线条。
+    """
+    w, h = im.size
+    radius = max(2, round(min(w, h) * 0.18))
+
+    plate = Image.new("RGBA", im.size, (0, 0, 0, 0))
+    ImageDraw.Draw(plate).rounded_rectangle([0, 0, w - 1, h - 1], radius=radius, fill=PLATE_COLOR)
+    # alpha_composite 而不是 paste: 要让线条的抗锯齿边缘和底板正确混合
+    return Image.alpha_composite(plate, im)
+
+
 def save_ico(frames: dict[tuple[int, int], Image.Image], path: Path) -> None:
     """把各尺寸打包成一个 ICO。"""
     sizes = sorted(frames)
@@ -85,6 +114,9 @@ def main() -> None:
     for name, (rgb, alpha) in variants.items():
         frames = {size: recolor(im, rgb, alpha) for size, im in base.items()}
         save_ico(frames, ASSETS / name)
+
+    # Web 工具的网页图标
+    save_ico({size: on_plate(im) for size, im in base.items()}, FAVICON)
 
     print("完成。别忘了重新构建以把新资源编进 exe。")
 

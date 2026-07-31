@@ -16,8 +16,8 @@
 
 // VS_VERSION_INFO 的值就是 1, 直接写数字以免 #include <winver.h>
 1 VERSIONINFO
-FILEVERSION 0,3,1,0
-PRODUCTVERSION 0,3,1,0
+FILEVERSION 0,4,0,0
+PRODUCTVERSION 0,4,0,0
 FILEFLAGSMASK 0x3FL
 FILEFLAGS 0x0L
 FILEOS 0x40004L
@@ -31,12 +31,12 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "huanfeng"
             VALUE "FileDescription",  "Windows 键盘/鼠标重映射工具"
-            VALUE "FileVersion",      "0.3.1"
+            VALUE "FileVersion",      "0.4.0"
             VALUE "InternalName",     "keyremap"
             VALUE "LegalCopyright",   "Copyright (c) 2026 huanfeng. MIT License"
             VALUE "OriginalFilename", "keyremap.exe"
             VALUE "ProductName",      "keyremap"
-            VALUE "ProductVersion",   "0.3.1"
+            VALUE "ProductVersion",   "0.4.0"
         END
     END
     BLOCK "VarFileInfo"

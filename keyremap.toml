@@ -63,5 +63,34 @@ group = "文本编辑"
 from = ["Ctrl", "E"]
 to = "Backspace"
 
+# ---- 屏蔽: to = [] 表示吞掉输入, 什么都不发出 ----
+
+[[mappings]]
+name = "防手滑关标签页"
+comment = "Ctrl+W 被屏蔽掉"
+group = "浏览器"
+enable = false               # 想用的话把这行删掉
+from = ["Ctrl", "W"]
+to = []
+
+# ---- CapsLock 当修饰键 ----
+# 按住期间不会切换大小写 (它的按下事件被吞掉了)。
+# 单独轻点会怎样, 取决于有没有为 CapsLock 单独配映射:
+#   没配                  -> 照常切换大小写
+#   配 to = []            -> 什么都不做, 这才是"禁用 CapsLock"
+#   配 to = "Esc" (如下)  -> 发 Esc, 即"轻点是 Esc、按住是修饰键"
+
+[[mappings]]
+name = "CapsLock转方向键"
+group = "文本编辑"
+from = ["CapsLock", "H"]
+to = "Left"
+
+[[mappings]]
+name = "轻点CapsLock发Esc"
+group = "文本编辑"
+from = "CapsLock"
+to = "Esc"
+
 # 上面两条互为反向映射, 同时启用也不会死循环:
 # 注入的按键带有标记, 钩子识别后会直接放行, 不会再次匹配。

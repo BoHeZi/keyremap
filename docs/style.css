@@ -140,7 +140,8 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 .key-picker select { flex: 1; min-width: 0; }
 
 .mods { display: flex; flex-wrap: wrap; gap: .1rem .55rem; margin-bottom: .2rem; }
-.mods label { display: inline-flex; gap: .2rem; align-items: center; font-size: .8rem; color: var(--muted); }
+/* nowrap: 修饰键名很短, 挤成两行反而看不清哪个勾选框配哪个名字 */
+.mods label { display: inline-flex; gap: .2rem; align-items: center; font-size: .8rem; color: var(--muted); white-space: nowrap; }
 
 .toggle { display: flex; align-items: center; gap: .3rem; font-size: .85rem; white-space: nowrap; }
 

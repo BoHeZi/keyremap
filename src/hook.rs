@@ -19,6 +19,7 @@ use std::sync::{Arc, OnceLock, RwLock};
 
 use log::{debug, info, warn};
 use windows_sys::Win32::Foundation::{LPARAM, LRESULT, WPARAM};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CAPITAL;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, HC_ACTION, KBDLLHOOKSTRUCT, MSG, MSLLHOOKSTRUCT,
     SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, WH_KEYBOARD_LL, WH_MOUSE_LL,
@@ -29,7 +30,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::Config;
 use crate::inject::{self, INJECTED_TAG};
-use crate::keycode::{Input, MouseButton, mods_held, name_from_mouse, name_from_vk};
+use crate::keycode::{Input, MOD_CAPS, MouseButton, mods_held, name_from_mouse, name_from_vk};
 
 /// 当前生效的配置。用 RwLock 包 Arc: 回调侧只读并克隆 Arc, 写侧 (热重载) 整体替换。
 static CONFIG: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
@@ -64,7 +65,12 @@ static MOUSE_HOOK: AtomicIsize = AtomicIsize::new(0);
 pub fn set_config(config: Config) {
     let cell = CONFIG.get_or_init(|| RwLock::new(Arc::new(Config::default())));
     match cell.write() {
-        Ok(mut guard) => *guard = Arc::new(config),
+        Ok(mut guard) => {
+            // 闸门必须跟着一起换, 否则新加的映射会在第一道关卡就被放行,
+            // 而删掉的映射对应的键还在白白往下走
+            refresh_gate(&config);
+            *guard = Arc::new(config);
+        }
         Err(e) => warn!("配置更新失败, 锁已中毒: {e}"),
     }
 }
@@ -190,9 +196,23 @@ fn dispatch(input: Input, is_down: bool) -> bool {
         return false;
     }
 
+    // 第一道闸门, 也是最要紧的一道: 这个输入源上根本没挂映射就直接放行。
+    //
+    // 只有一次数组读取 —— 不加锁, 也不克隆 Arc。绝大多数按键在这里就返回了,
+    // 用户实际配了映射的键才值得往下走。位图在配置变更时重算, 见 refresh_gate。
+    if !WATCHED[slot(input)].load(Ordering::Relaxed) {
+        return false;
+    }
+
     let Some(config) = current_config() else {
         return false;
     };
+
+    // CapsLock 被当作修饰键用时要特殊照顾: 它本身按一下就切换大小写,
+    // 直接放行的话按一次 CapsLock+H 会顺带把大小写切了。
+    if config.uses_caps_mod && input == Input::Key(VK_CAPITAL) {
+        return handle_caps(&config, is_down);
+    }
 
     // 抬起事件优先看"这个键的按下是不是被我们吞掉的"。
     //
@@ -212,7 +232,15 @@ fn dispatch(input: Input, is_down: bool) -> bool {
         if m.from != input || !config.is_active(m) {
             continue;
         }
-        if !mods_held(m.from_mods) {
+        // CapsLock 得单独问我们自己那份记录, 不能去问系统。
+        //
+        // 因为它的按下事件正是被我们吞掉的 —— 钩子回调返回非零之后事件就被丢弃,
+        // 压根不会进入系统的按键状态, `GetAsyncKeyState(VK_CAPITAL)` 因此永远
+        // 报告"没按下"。自己藏起来的键, 只能自己记着。
+        if m.from_mods & MOD_CAPS != 0 && !CAPS_DOWN.load(Ordering::Relaxed) {
+            continue;
+        }
+        if !mods_held(m.from_mods & !MOD_CAPS) {
             continue;
         }
 
@@ -223,15 +251,22 @@ fn dispatch(input: Input, is_down: bool) -> bool {
                 // 后者不该凭空补一个动作出来, 放行即可。
                 continue;
             }
+            // 用 CapsLock 触发过, 那这次按下就不算"单独轻点"了
+            if m.from_mods & MOD_CAPS != 0 {
+                CAPS_CONSUMED.store(true, Ordering::Relaxed);
+            }
+
             // 长按时系统会重复发按下事件, 此时标记已经在了。
             let repeat = is_triggered(input);
             mark_triggered(input);
 
             // 单键目标允许连发 (长按 Ctrl+E 连续删字, 这正是这类映射的用处);
             // 组合键目标只认第一次 —— Ctrl+W 之类连发会连关一串标签页。
-            if !(m.is_combo() && repeat) {
+            if !m.is_block() && !(m.is_combo() && repeat) {
                 inject::send_with_mods_released(m.from_mods, &m.to);
             }
+        } else if m.is_block() {
+            // 屏蔽: 按下抬起都吞掉, 什么也不发出
         } else if m.is_combo() {
             // 组合键在**抬起**时触发一次。
             // 若改在按下时触发, 长按会被系统的按键重复反复触发 ——
@@ -248,6 +283,63 @@ fn dispatch(input: Input, is_down: bool) -> bool {
     false
 }
 
+// ---------- CapsLock 当修饰键 ----------
+
+/// CapsLock 此刻是否按着 (由我们自己吞下的那些事件推出来)。
+static CAPS_DOWN: AtomicBool = AtomicBool::new(false);
+/// 本次按住期间有没有靠它触发过映射。抬起时用来区分"当修饰键用"和"单独轻点"。
+static CAPS_CONSUMED: AtomicBool = AtomicBool::new(false);
+
+/// 处理 CapsLock 自身的按下与抬起。返回 true 表示吞掉。
+///
+/// 按下一律吞掉 —— 放行的话大小写就被切了, 而用户按它是为了当修饰键。
+///
+/// 抬起时分两种情况:
+///
+/// - **期间触发过映射**: 它这次是在当修饰键, 吞掉收工。
+/// - **单独轻点**: 不能就这么把 CapsLock 的原有功能吃掉。此时去看有没有为
+///   CapsLock 单独配的映射 (不带修饰键的那种), 有就执行它, 没有就补发一次
+///   真正的 CapsLock。
+///
+/// 这样三种用法用同一条规则就都成立了, 不需要额外的开关:
+///
+/// ```text
+/// 只配 CapsLock+H          -> 轻点照常切换大小写, 什么都没丢
+/// 再配 CapsLock -> []      -> 轻点什么都不做, 这才是"禁用 CapsLock"
+/// 再配 CapsLock -> Esc     -> 轻点是 Esc, 按住是修饰键
+/// ```
+fn handle_caps(config: &Config, is_down: bool) -> bool {
+    if is_down {
+        // 长按会重复发按下事件, 只有第一次才重置"用过没有"
+        if !CAPS_DOWN.swap(true, Ordering::Relaxed) {
+            CAPS_CONSUMED.store(false, Ordering::Relaxed);
+        }
+        return true;
+    }
+
+    CAPS_DOWN.store(false, Ordering::Relaxed);
+    if CAPS_CONSUMED.swap(false, Ordering::Relaxed) {
+        return true;
+    }
+
+    // 单独轻点: 有没有专门给 CapsLock 配的映射?
+    for &i in &config.order {
+        let Some(m) = config.mappings.get(i as usize) else {
+            continue;
+        };
+        if m.from == Input::Key(VK_CAPITAL) && !m.has_mods() && config.is_active(m) {
+            if !m.is_block() {
+                inject::send_combination(&m.to);
+            }
+            return true;
+        }
+    }
+
+    // 没配就把它原样补一次, 免得平白剥夺了这个键本来的功能
+    inject::send_combination(&[VK_CAPITAL]);
+    true
+}
+
 // ---------- "按下已被吞掉"的记号 ----------
 
 /// 每个可能的输入源一位, 记录它的按下事件是否被带修饰键的映射吞掉了。
@@ -261,6 +353,39 @@ static TRIGGERED: [AtomicBool; TRIGGER_SLOTS] = [const { AtomicBool::new(false) 
 
 /// 虚拟键 0..=255 各占一位, 之后接 5 个鼠标按键。
 const TRIGGER_SLOTS: usize = 256 + 5;
+
+/// 哪些输入源上挂着映射 —— 钩子回调的第一道闸门, 见 [`dispatch`]。
+///
+/// 单独摆一份位图而不是每次去遍历配置, 是因为遍历得先拿读锁再克隆 Arc,
+/// 而**绝大多数按键跟配置毫无关系**, 那些代价完全是白花的。这里一次数组读取
+/// 就能把它们放走。
+///
+/// 不看启用状态: 托盘里临时关掉一条映射不该动这份位图, 否则再打开时还得记得
+/// 重算。启用与否交给后面的 `is_active`, 那已经不在热路径上了。
+static WATCHED: [AtomicBool; TRIGGER_SLOTS] = [const { AtomicBool::new(false) }; TRIGGER_SLOTS];
+
+/// 按新配置重算闸门位图。每次配置替换之后都要调用。
+fn refresh_gate(config: &Config) {
+    let mut next = [false; TRIGGER_SLOTS];
+    for m in &config.mappings {
+        next[slot(m.from)] = true;
+    }
+    // CapsLock 当修饰键时, 它自己的按下抬起也得进回调 —— 要吞掉
+    if config.uses_caps_mod {
+        next[slot(Input::Key(VK_CAPITAL))] = true;
+    }
+
+    for (cell, on) in WATCHED.iter().zip(next) {
+        cell.store(on, Ordering::Relaxed);
+    }
+    // 顺手清掉遗留的"已吞下"记号: 配置一换, 记号对应的映射可能已经不在了,
+    // 留着会让之后某个抬起事件被无端吞掉一次。
+    for cell in &TRIGGERED {
+        cell.store(false, Ordering::Relaxed);
+    }
+    CAPS_DOWN.store(false, Ordering::Relaxed);
+    CAPS_CONSUMED.store(false, Ordering::Relaxed);
+}
 
 /// 输入源到位下标。虚拟键实际不会超过 255, 越界的一律折到最后兜底,
 /// 宁可几个怪键共用一位, 也不能越界。
@@ -486,6 +611,48 @@ mod tests {
     fn 越界的虚拟键不会写到数组外() {
         // vkCode 来自系统结构体, 理论上不超过 255, 但越界写入的代价太大, 兜一下底
         assert!(slot(Input::Key(u16::MAX)) < TRIGGER_SLOTS);
+    }
+
+    #[test]
+    fn 闸门只放行配了映射的输入源() {
+        let cfg = crate::config::parse(
+            "[[mappings]]\nfrom = \"Pause\"\nto = \"Insert\"\n\n\
+             [[mappings]]\nfrom = \"MouseX2\"\nto = \"Delete\"",
+        )
+        .unwrap();
+        refresh_gate(&cfg);
+
+        let pause = crate::keycode::vk_from_name("Pause").unwrap();
+        assert!(WATCHED[slot(Input::Key(pause))].load(Ordering::Relaxed));
+        assert!(WATCHED[slot(Input::Mouse(MouseButton::X2))].load(Ordering::Relaxed));
+
+        // 没配的键必须在第一道闸门就被放走 —— 那正是这份位图存在的意义
+        let a = crate::keycode::vk_from_name("A").unwrap();
+        assert!(!WATCHED[slot(Input::Key(a))].load(Ordering::Relaxed));
+        assert!(!WATCHED[slot(Input::Mouse(MouseButton::Left))].load(Ordering::Relaxed));
+        // 没人拿 CapsLock 当修饰键时, 它也不该被拦下来
+        assert!(!WATCHED[slot(Input::Key(VK_CAPITAL))].load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn 用了capslock修饰键才拦capslock() {
+        let cfg = crate::config::parse("[[mappings]]\nfrom = [\"CapsLock\", \"H\"]\nto = \"Left\"")
+            .unwrap();
+        refresh_gate(&cfg);
+        // 触发键是 H, 但 CapsLock 自身也必须进回调 —— 得吞掉它免得切大小写
+        assert!(WATCHED[slot(Input::Key(VK_CAPITAL))].load(Ordering::Relaxed));
+    }
+
+    #[test]
+    fn 换配置时清掉遗留的已吞下记号() {
+        let k = Input::Key(201);
+        mark_triggered(k);
+        let cfg = crate::config::parse("[[mappings]]\nfrom = \"Pause\"\nto = \"Insert\"").unwrap();
+        refresh_gate(&cfg);
+        assert!(
+            !is_triggered(k),
+            "留着旧记号会让之后某个抬起事件被无端吞掉一次"
+        );
     }
 
     #[test]

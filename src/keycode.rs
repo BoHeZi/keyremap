@@ -189,6 +189,12 @@ pub const MOD_RALT: u16 = 1 << 9;
 pub const MOD_LWIN: u16 = 1 << 10;
 pub const MOD_RWIN: u16 = 1 << 11;
 
+/// CapsLock 当修饰键用。
+///
+/// 它和上面那些不一样: CapsLock 是个普通按键, 按一下就会切换大小写状态。
+/// 所以一旦有映射用到它, 钩子必须把它的按下事件吞掉, 见 `hook::handle_caps`。
+pub const MOD_CAPS: u16 = 1 << 12;
+
 /// 修饰键名 -> 位。写法与键名表一致地大小写不敏感。
 /// 分侧的名字与 [`KEY_TABLE`] 里的一致, 用户不用记两套。
 const MOD_TABLE: &[(&str, u16)] = &[
@@ -205,6 +211,7 @@ const MOD_TABLE: &[(&str, u16)] = &[
     ("RAlt", MOD_RALT),
     ("LWin", MOD_LWIN),
     ("RWin", MOD_RWIN),
+    ("CapsLock", MOD_CAPS),
 ];
 
 /// 每个位对应的 (左键, 右键)。通用位两侧都要看, 分侧位只看自己那一侧。
@@ -223,6 +230,9 @@ const MOD_SIDES: &[(u16, u16, Option<u16>)] = &[
     (MOD_RALT, VK_RMENU, None),
     (MOD_LWIN, VK_LWIN, None),
     (MOD_RWIN, VK_RWIN, None),
+    // 这里**没有** MOD_CAPS, 是有意的。CapsLock 的按下事件被钩子吞掉了,
+    // 而被吞掉的事件不会进入系统的按键状态 —— 去问 GetAsyncKeyState 永远得到
+    // "没按下"。它的按住状态只能由 hook 自己记录, 见 `hook::CAPS_DOWN`。
 ];
 
 /// 按名字解析修饰键位。不是修饰键就返回 None。
@@ -250,6 +260,7 @@ pub fn mods_name(mods: u16) -> String {
         (MOD_WIN, "Win"),
         (MOD_LWIN, "LWin"),
         (MOD_RWIN, "RWin"),
+        (MOD_CAPS, "CapsLock"),
     ];
     ORDER
         .iter()

@@ -118,26 +118,44 @@ pub fn send_with_mods_released(mods: u16, vks: &[u16]) -> bool {
     }
     let (mod_keys, mod_n) = held_mod_vks(mods);
 
+    // 目标序列里本来就要按的修饰键, 不必松开再按回 —— 那样应用会平白看到一次
+    // 抖动。`Ctrl+Q -> Ctrl+W` 是最典型的例子: 用户按着的 Ctrl 正是目标要的,
+    // 直接留着就好, 只发 W 即可。
+    //
+    // 只在虚拟键**完全相同**时才这么省。用户按的是右 Ctrl、目标写的是通用
+    // `Ctrl` (注入时落到左 Ctrl) 就不算 —— 那种情况老老实实松开再按回更稳妥,
+    // 尤其 RAlt 在很多键盘布局上是 AltGr, 与左 Alt 并不等价。
+    let keep = |vk: u16| vks[..n].iter().any(|&t| normalize_for_inject(t) == vk);
+
     // 栈上固定数组: 松开修饰键 + 目标序列按下抬起 + 按回修饰键
     let mut buf: [INPUT; MAX_MODS * 2 + MAX_COMBO * 2] = unsafe { std::mem::zeroed() };
     let mut len = 0;
 
     for &vk in mod_keys.iter().take(mod_n) {
-        buf[len] = key_input(vk, true);
-        len += 1;
+        if !keep(vk) {
+            buf[len] = key_input(vk, true);
+            len += 1;
+        }
     }
+    // 已经按着的那几个修饰键在目标序列里也跳过, 否则会多出一次按下与抬起
     for &vk in vks.iter().take(n) {
-        buf[len] = key_input(vk, false);
-        len += 1;
+        if !mod_keys[..mod_n].contains(&normalize_for_inject(vk)) {
+            buf[len] = key_input(vk, false);
+            len += 1;
+        }
     }
     for &vk in vks.iter().take(n).rev() {
-        buf[len] = key_input(vk, true);
-        len += 1;
+        if !mod_keys[..mod_n].contains(&normalize_for_inject(vk)) {
+            buf[len] = key_input(vk, true);
+            len += 1;
+        }
     }
     // 反序按回, 与松开的顺序对称
     for &vk in mod_keys.iter().take(mod_n).rev() {
-        buf[len] = key_input(vk, false);
-        len += 1;
+        if !keep(vk) {
+            buf[len] = key_input(vk, false);
+            len += 1;
+        }
     }
 
     send(&buf[..len])
@@ -166,17 +184,20 @@ mod tests {
     /// 复刻 send_with_mods_released 的排列逻辑, 但把"当前按着哪些修饰键"
     /// 作为参数传进来 —— 真实函数那一步要查系统状态, 测试里没法造。
     fn build(held: &[u16], vks: &[u16]) -> Vec<(u16, bool)> {
+        let keep = |vk: u16| vks.iter().any(|&t| normalize_for_inject(t) == vk);
+        let already = |vk: u16| held.contains(&normalize_for_inject(vk));
+
         let mut buf = Vec::new();
-        for &vk in held {
+        for &vk in held.iter().filter(|&&vk| !keep(vk)) {
             buf.push(key_input(vk, true));
         }
-        for &vk in vks {
+        for &vk in vks.iter().filter(|&&vk| !already(vk)) {
             buf.push(key_input(vk, false));
         }
-        for &vk in vks.iter().rev() {
+        for &vk in vks.iter().rev().filter(|&&vk| !already(vk)) {
             buf.push(key_input(vk, true));
         }
-        for &vk in held.iter().rev() {
+        for &vk in held.iter().rev().filter(|&&vk| !keep(vk)) {
             buf.push(key_input(vk, false));
         }
         seq(&buf)
@@ -207,6 +228,43 @@ mod tests {
             !s.iter().any(|(vk, _)| *vk == VK_LCONTROL),
             "不该碰用户没按的那一侧: {s:?}"
         );
+    }
+
+    #[test]
+    fn 目标也要的修饰键就留着不动() {
+        // Ctrl+Q -> Ctrl+W: 用户按着的 Ctrl 正是目标要的, 留着即可,
+        // 松开再按回只会让应用平白看到一次抖动
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_W};
+        let s = build(&[VK_LCONTROL], &[VK_CONTROL, VK_W]);
+        assert_eq!(s, vec![(VK_W, false), (VK_W, true)], "只该发出 W: {s:?}");
+    }
+
+    #[test]
+    fn 只留下目标要的那个其余照旧松开() {
+        // Ctrl+Shift+X -> Ctrl+C: Ctrl 留着, Shift 必须松开,
+        // 否则应用收到的是 Ctrl+Shift+C
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_C, VK_CONTROL};
+        let s = build(&[VK_LCONTROL, VK_LSHIFT], &[VK_CONTROL, VK_C]);
+        assert_eq!(
+            s,
+            vec![
+                (VK_LSHIFT, true),
+                (VK_C, false),
+                (VK_C, true),
+                (VK_LSHIFT, false),
+            ]
+        );
+    }
+
+    #[test]
+    fn 左右不同时不做这个省略() {
+        // 按的是右 Ctrl 而目标写的是通用 Ctrl (注入落到左 Ctrl), 两者并不是
+        // 同一个键。老实松开再按回, 结果依然正确
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_W};
+        let s = build(&[VK_RCONTROL], &[VK_CONTROL, VK_W]);
+        assert_eq!(s.first(), Some(&(VK_RCONTROL, true)));
+        assert_eq!(s.last(), Some(&(VK_RCONTROL, false)));
+        assert!(s.iter().any(|(vk, _)| *vk == VK_LCONTROL), "{s:?}");
     }
 
     #[test]

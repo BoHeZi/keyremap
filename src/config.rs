@@ -13,8 +13,8 @@ use serde::Deserialize;
 
 use crate::inject::MAX_COMBO;
 use crate::keycode::{
-    Input, MAX_MODS, input_from_name, mod_from_name, mods_name, name_from_mouse, name_from_vk,
-    vk_from_name,
+    Input, MAX_MODS, MOD_CAPS, input_from_name, mod_from_name, mods_name, name_from_mouse,
+    name_from_vk, vk_from_name,
 };
 
 /// 未分组映射在菜单里显示的名字。
@@ -131,6 +131,11 @@ impl Mapping {
         self.to.len() > 1
     }
 
+    /// 是否是"屏蔽"映射: 吞掉输入但什么都不发出。
+    pub fn is_block(&self) -> bool {
+        self.to.is_empty()
+    }
+
     /// 输入源是否带修饰键 (即 `from` 写成了数组形式)。
     pub fn has_mods(&self) -> bool {
         self.from_mods != 0
@@ -164,6 +169,9 @@ impl Mapping {
 impl fmt::Display for Mapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let from = self.input_name();
+        if self.is_block() {
+            return write!(f, "{from} -> (屏蔽)");
+        }
         let to = self
             .to
             .iter()
@@ -185,6 +193,9 @@ pub struct Config {
     pub mappings: Vec<Mapping>,
     /// 钩子回调遍历 [`Config::mappings`] 时使用的下标顺序, 见 [`match_order`]。
     pub order: Vec<u32>,
+    /// 是否有映射把 CapsLock 当修饰键。有的话钩子要吞掉它的按下事件,
+    /// 否则按一次 CapsLock+H 会顺带把大小写切了。
+    pub uses_caps_mod: bool,
 }
 
 impl Config {
@@ -310,9 +321,8 @@ pub fn parse(content: &str) -> Result<Config, String> {
 
         let to_names = rm.to.parts();
 
-        if to_names.is_empty() {
-            return Err(format!("{label}: to 不能为空"));
-        }
+        // to = [] 是合法的, 表示"吞掉这个输入, 什么都不发出" —— 用来屏蔽误触,
+        // 比如给 Ctrl+W 配个空目标防止手滑关掉标签页。
         if to_names.len() > MAX_COMBO {
             return Err(format!(
                 "{label}: 组合键最多 {MAX_COMBO} 个, 实际 {}",
@@ -354,12 +364,14 @@ pub fn parse(content: &str) -> Result<Config, String> {
     }
 
     let order = match_order(&mappings);
+    let uses_caps_mod = mappings.iter().any(|m| m.from_mods & MOD_CAPS != 0);
     Ok(Config {
         name: raw.name,
         web_url_override: raw.web_url,
         groups,
         mappings,
         order,
+        uses_caps_mod,
     })
 }
 
@@ -394,7 +406,11 @@ fn parse_from(parts: &[String], label: &str) -> Result<(Input, u16), String> {
 
     // 触发键自己不能又是修饰键: `["Ctrl", "Shift"]` 这种写法没有明确含义 ——
     // 到底是"按住 Ctrl 时按 Shift"还是"同时按住两个"? 直接拒掉, 不猜。
-    if mod_from_name(trigger_name).is_some() {
+    //
+    // CapsLock 不在此列。它虽然也能当修饰键, 但本身是个有虚拟键的普通按键,
+    // `from = "CapsLock"` (轻点它触发什么) 是明确且常用的写法 —— 事实上
+    // "轻点是 Esc, 按住是修饰键"正要靠这条。
+    if mod_from_name(trigger_name).is_some_and(|bit| bit != MOD_CAPS) {
         return Err(format!(
             "{label}: 触发键不能是修饰键 (\"{trigger_name}\"), \
              修饰键只能写在前面"
@@ -423,7 +439,7 @@ fn match_order(mappings: &[Mapping]) -> Vec<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keycode::{MOD_CTRL, MOD_RALT, MOD_SHIFT, MouseButton};
+    use crate::keycode::{MOD_CAPS, MOD_CTRL, MOD_RALT, MOD_SHIFT, MouseButton};
 
     const SAMPLE: &str = r#"
 name = "测试配置"
@@ -550,6 +566,57 @@ to = "Delete"
         )
         .unwrap();
         assert!(cfg.find_conflicts().is_empty());
+    }
+
+    // ---- 屏蔽与 CapsLock ----
+
+    #[test]
+    fn 空的to表示屏蔽() {
+        let m = one("[[mappings]]\nfrom = [\"Ctrl\", \"W\"]\nto = []");
+        assert!(m.is_block());
+        assert!(!m.is_combo(), "空目标不该被当成组合键");
+        assert_eq!(m.to_string(), "Ctrl + W -> (屏蔽)");
+    }
+
+    #[test]
+    fn 屏蔽也可以用在单键上() {
+        let m = one("[[mappings]]\nfrom = \"CapsLock\"\nto = []");
+        assert!(m.is_block());
+        assert!(!m.has_mods());
+    }
+
+    #[test]
+    fn capslock可以当修饰键() {
+        let cfg = parse("[[mappings]]\nfrom = [\"CapsLock\", \"H\"]\nto = \"Left\"").unwrap();
+        assert_eq!(cfg.mappings[0].from_mods, MOD_CAPS);
+        assert_eq!(cfg.mappings[0].input_name(), "CapsLock + H");
+        assert!(cfg.uses_caps_mod, "钩子要据此决定是否吞掉 CapsLock");
+    }
+
+    #[test]
+    fn 没用capslock当修饰键时不置标志() {
+        // 这个标志直接决定钩子要不要拦 CapsLock, 误置会平白改变它的行为
+        let cfg = parse("[[mappings]]\nfrom = \"CapsLock\"\nto = \"Esc\"").unwrap();
+        assert!(!cfg.uses_caps_mod, "只是把 CapsLock 当普通输入源, 不算");
+    }
+
+    #[test]
+    fn capslock轻点与按住可以并存() {
+        // 经典布局: 轻点是 Esc, 按住是修饰键
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "CapsLock"
+to = "Esc"
+
+[[mappings]]
+from = ["CapsLock", "H"]
+to = "Left"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.uses_caps_mod);
+        assert!(cfg.find_conflicts().is_empty(), "两者输入源不同, 不算冲突");
     }
 
     #[test]

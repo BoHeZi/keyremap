@@ -18,7 +18,8 @@ const MODIFIERS = ['Ctrl', 'Alt', 'Shift', 'LWin'];
 // 输入源一侧的修饰键。通用写法 (Ctrl) 表示左右任一按下即算, 分侧写法 (LCtrl)
 // 只认那一边。界面上默认只给四个通用的勾选框, 分侧写法留给手写配置 ——
 // 十二个勾选框会把界面塞满, 而分侧是少数需求。
-const FROM_MODIFIERS = ['Ctrl', 'Alt', 'Shift', 'Win'];
+// CapsLock 也在其中: 主程序允许拿它当修饰键 (按住不放时不会切换大小写)。
+const FROM_MODIFIERS = ['Ctrl', 'Alt', 'Shift', 'Win', 'CapsLock'];
 
 // 识别用的全集: 手写配置里出现 LCtrl 之类时, 得认出它是修饰键而不是触发键,
 // 否则会被当成"两个触发键"而退回原始文本框。
@@ -184,10 +185,15 @@ function parseToml(text) {
 
 const escStr = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
-/** 键位序列写成 TOML。单个键用字符串形式, 与手写配置的习惯一致。 */
+/**
+ * 键位序列写成 TOML。单个键用字符串形式, 与手写配置的习惯一致。
+ *
+ * 空序列写成 `= []` 而不是整行省略: 对 to 来说空数组是有含义的 (屏蔽该输入),
+ * 而省略整行会让主程序报"缺少字段", 看不出是想屏蔽还是漏写了。
+ */
 function keysToToml(field, keys) {
   const list = (keys || []).filter(Boolean);
-  if (list.length === 0) return '';
+  if (list.length === 0) return `${field} = []\n`;
   return list.length === 1
     ? `${field} = "${escStr(list[0])}"\n`
     : `${field} = [${list.map((k) => `"${escStr(k)}"`).join(', ')}]\n`;
@@ -333,6 +339,14 @@ function configApp() {
 
     // ---- 输出 (to) 的编辑 ----
 
+    /** 空的 to 表示屏蔽: 吞掉这个输入, 什么都不发出 */
+    isBlocked(m) {
+      return m.to.length === 0;
+    },
+    setBlocked(m, on) {
+      m.to = on ? [] : [this.mainKey(m) || this.KEYS.keys[0] || ''].filter(Boolean);
+    },
+
     /** to 能否表示成"若干修饰键 + 一个主键" */
     isSimpleTo(m) {
       return m.to.filter((k) => !MODIFIERS.includes(k)).length === 1;
@@ -358,15 +372,24 @@ function configApp() {
     // 和输出侧同一个套路: 修饰键在前, 触发键在最后一个。
     // 但认的是 FROM_MODIFIERS_ALL —— 输入源这边还可以指定左右某一侧 (LCtrl 等)。
 
+    // from 里**末位就是触发键**, 前面的都是修饰键 —— 与主程序同一条规则。
+    //
+    // 不能改用"按名字挑出非修饰键的那个": CapsLock 两种角色都能担,
+    // `["CapsLock","H"]` 里它是修饰键, 而 `["CapsLock"]` 里它是触发键。
+    // 按名字判断会把后者的触发键判成空。
+
     /** from 能否表示成"若干修饰键 + 一个触发键" */
     isSimpleFrom(m) {
-      return m.from.filter((k) => !FROM_MODIFIERS_ALL.includes(k)).length === 1;
+      return m.from.length > 0 && this.fromMods(m).every((k) => FROM_MODIFIERS_ALL.includes(k));
+    },
+    fromMods(m) {
+      return m.from.slice(0, -1);
     },
     hasFromMod(m, mod) {
-      return m.from.includes(mod);
+      return this.fromMods(m).includes(mod);
     },
     fromMain(m) {
-      return m.from.find((k) => !FROM_MODIFIERS_ALL.includes(k)) || '';
+      return m.from[m.from.length - 1] || '';
     },
     /**
      * 这条映射要显示哪些修饰键勾选框: 四个通用的, 外加它自己用到的分侧修饰键。
@@ -374,20 +397,18 @@ function configApp() {
      * 否则用户看不见也取消不掉。
      */
     fromModList(m) {
-      const extra = m.from.filter(
-        (k) => FROM_MODIFIERS_ALL.includes(k) && !FROM_MODIFIERS.includes(k),
-      );
+      const extra = this.fromMods(m).filter((k) => !FROM_MODIFIERS.includes(k));
       return [...FROM_MODIFIERS, ...extra];
     },
     /** 每次都从当前 from 重算，不依赖任何渲染时的快照 */
     setFromMod(m, mod, on) {
-      // 用全集过滤, 这样手写的 LCtrl 之类不会因为勾了别的框而被抹掉
-      const mods = FROM_MODIFIERS_ALL.filter((x) => (x === mod ? on : m.from.includes(x)));
+      // 按 FROM_MODIFIERS_ALL 的顺序重排, 这样手写的 LCtrl 之类也保得住
+      const held = this.fromMods(m);
+      const mods = FROM_MODIFIERS_ALL.filter((x) => (x === mod ? on : held.includes(x)));
       m.from = [...mods, this.fromMain(m)].filter(Boolean);
     },
     setFromMain(m, key) {
-      const mods = FROM_MODIFIERS_ALL.filter((x) => m.from.includes(x));
-      m.from = [...mods, key].filter(Boolean);
+      m.from = [...this.fromMods(m), key].filter(Boolean);
     },
 
     // ---- 条目增删 ----

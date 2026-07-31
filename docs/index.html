@@ -106,8 +106,17 @@
 
       <div class="field">
         <label>输出 (to)</label>
+        <!-- 勾上"屏蔽"就是吞掉这个输入、什么都不发出, 用来防误触。
+             外面套一层 .mods 是为了复用修饰键勾选框的那套排版 -->
+        <div class="mods">
+          <label title="吞掉这个输入，不发出任何按键（防误触）">
+            <input type="checkbox" :checked="isBlocked(m)"
+                   @change="setBlocked(m, $event.target.checked)">
+            <span>屏蔽</span>
+          </label>
+        </div>
         <!-- 能拆成"若干修饰键 + 一个主键"时给友好界面, 否则退回原始文本, 避免丢数据 -->
-        <template x-if="isSimpleTo(m)">
+        <template x-if="!isBlocked(m) && isSimpleTo(m)">
           <div>
             <div class="mods">
               <template x-for="mod in MODIFIERS" :key="mod">
@@ -126,7 +135,7 @@
             </select>
           </div>
         </template>
-        <template x-if="!isSimpleTo(m)">
+        <template x-if="!isBlocked(m) && !isSimpleTo(m)">
           <input type="text" :value="m.to.join(', ')"
                  @input="m.to = $event.target.value.split(',').map(s => s.trim()).filter(Boolean)"
                  placeholder="Ctrl, W">

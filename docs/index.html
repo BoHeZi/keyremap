@@ -64,21 +64,44 @@
 
       <div class="field">
         <label>输入 (from)</label>
-        <div class="key-picker">
-          <select x-model="m.from">
-            <optgroup label="键盘">
-              <template x-for="k in KEYS.keys" :key="k">
-                <option :value="k" x-text="k"></option>
+        <!-- 勾上修饰键就变成"按住它们再按触发键", 例如 Ctrl + E -->
+        <template x-if="isSimpleFrom(m)">
+          <div>
+            <div class="mods">
+              <template x-for="mod in fromModList(m)" :key="mod">
+                <label>
+                  <input type="checkbox" :checked="hasFromMod(m, mod)"
+                         @change="setFromMod(m, mod, $event.target.checked)">
+                  <span x-text="mod"></span>
+                </label>
               </template>
-            </optgroup>
-            <optgroup label="鼠标">
-              <template x-for="k in KEYS.mouse" :key="k">
-                <option :value="k" x-text="k"></option>
-              </template>
-            </optgroup>
-          </select>
-          <button class="ghost" @click="startCapture(m)">捕获</button>
-        </div>
+            </div>
+            <div class="key-picker">
+              <!-- 选中状态给到 option 而不是 select 上。选项是 x-for 动态生成的,
+                   在 select 上写 :value 会在选项还没渲染出来时就被浏览器丢弃,
+                   结果是打开已有配置时每个下拉框都显示成第一项 -->
+              <select @change="setFromMain(m, $event.target.value)">
+                <optgroup label="键盘">
+                  <template x-for="k in KEYS.keys" :key="k">
+                    <option :value="k" x-text="k" :selected="k === fromMain(m)"></option>
+                  </template>
+                </optgroup>
+                <optgroup label="鼠标">
+                  <template x-for="k in KEYS.mouse" :key="k">
+                    <option :value="k" x-text="k" :selected="k === fromMain(m)"></option>
+                  </template>
+                </optgroup>
+              </select>
+              <button class="ghost" @click="startCapture(m)">捕获</button>
+            </div>
+          </div>
+        </template>
+        <!-- 拆不出"修饰键 + 一个触发键"时退回原始文本, 免得改坏用户写的东西 -->
+        <template x-if="!isSimpleFrom(m)">
+          <input type="text" :value="m.from.join(', ')"
+                 @input="m.from = $event.target.value.split(',').map(s => s.trim()).filter(Boolean)"
+                 placeholder="Ctrl, E">
+        </template>
       </div>
 
       <div class="field">
@@ -95,9 +118,10 @@
                 </label>
               </template>
             </div>
-            <select :value="mainKey(m)" @change="setMainKey(m, $event.target.value)">
+            <!-- 同上: 选中状态必须放在 option 上 -->
+            <select @change="setMainKey(m, $event.target.value)">
               <template x-for="k in KEYS.keys" :key="k">
-                <option :value="k" x-text="k"></option>
+                <option :value="k" x-text="k" :selected="k === mainKey(m)"></option>
               </template>
             </select>
           </div>

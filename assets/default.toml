@@ -34,3 +34,11 @@ name = "我的配置"
 # group = "浏览器"
 # from = "MouseX2"
 # to = ["Ctrl", "W"]
+#
+# from 也能写成数组, 表示"按住前面那些修饰键再按最后这个":
+# 修饰键只能是 Ctrl / Shift / Alt / Win, 不分左右。
+#
+# [[mappings]]
+# name = "Ctrl+E转Backspace"
+# from = ["Ctrl", "E"]
+# to = "Backspace"

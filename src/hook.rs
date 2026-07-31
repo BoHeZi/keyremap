@@ -29,7 +29,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 use crate::config::Config;
 use crate::inject::{self, INJECTED_TAG};
-use crate::keycode::{Input, MouseButton, name_from_mouse, name_from_vk};
+use crate::keycode::{Input, MouseButton, mods_held, name_from_mouse, name_from_vk};
 
 /// 当前生效的配置。用 RwLock 包 Arc: 回调侧只读并克隆 Arc, 写侧 (热重载) 整体替换。
 static CONFIG: OnceLock<RwLock<Arc<Config>>> = OnceLock::new();
@@ -194,13 +194,45 @@ fn dispatch(input: Input, is_down: bool) -> bool {
         return false;
     };
 
-    for m in &config.mappings {
-        // is_active 同时看映射自身的开关和所属组的开关, 只是一次数组索引
+    // 抬起事件优先看"这个键的按下是不是被我们吞掉的"。
+    //
+    // 不能只靠重新匹配一遍: 用户完全可能先松开 Ctrl 再松开 E, 那时修饰键
+    // 条件已经不成立, 重新匹配会失败, 于是一个没有配对按下的 E 抬起漏给应用。
+    if !is_down && take_triggered(input) {
+        return true;
+    }
+
+    // 按 config.order 遍历: 修饰键多的排在前面, 这样 `Ctrl+E` 能盖过 `E`。
+    for &i in &config.order {
+        let Some(m) = config.mappings.get(i as usize) else {
+            continue;
+        };
+        // 先比触发键 —— 一次整数比较, 绝大多数按键在这一步就被排除,
+        // 根本不会去查修饰键状态。is_active 也只是一次数组索引。
         if m.from != input || !config.is_active(m) {
             continue;
         }
+        if !mods_held(m.from_mods) {
+            continue;
+        }
 
-        if m.is_combo() {
+        if m.has_mods() {
+            if !is_down {
+                // 带修饰键的映射只在按下时动作。抬起要么在上面被 take_triggered
+                // 接走了, 要么是"按下时没匹配、抬起时才匹配上"的边缘情况 ——
+                // 后者不该凭空补一个动作出来, 放行即可。
+                continue;
+            }
+            // 长按时系统会重复发按下事件, 此时标记已经在了。
+            let repeat = is_triggered(input);
+            mark_triggered(input);
+
+            // 单键目标允许连发 (长按 Ctrl+E 连续删字, 这正是这类映射的用处);
+            // 组合键目标只认第一次 —— Ctrl+W 之类连发会连关一串标签页。
+            if !(m.is_combo() && repeat) {
+                inject::send_with_mods_released(m.from_mods, &m.to);
+            }
+        } else if m.is_combo() {
             // 组合键在**抬起**时触发一次。
             // 若改在按下时触发, 长按会被系统的按键重复反复触发 ——
             // 对 Ctrl+W 这类破坏性操作意味着连关一串标签页。
@@ -214,6 +246,42 @@ fn dispatch(input: Input, is_down: bool) -> bool {
         return true;
     }
     false
+}
+
+// ---------- "按下已被吞掉"的记号 ----------
+
+/// 每个可能的输入源一位, 记录它的按下事件是否被带修饰键的映射吞掉了。
+///
+/// 存在的意义只有一个: 保证抬起事件跟按下事件同进同出。少了它, 用户先松开
+/// 修饰键再松开触发键时, 应用会收到一个没有配对按下的抬起 —— 有些程序会
+/// 因此认为该键卡住了。
+///
+/// 用定长数组而不是 HashSet: 钩子回调里不能有堆分配, 也不该有哈希计算。
+static TRIGGERED: [AtomicBool; TRIGGER_SLOTS] = [const { AtomicBool::new(false) }; TRIGGER_SLOTS];
+
+/// 虚拟键 0..=255 各占一位, 之后接 5 个鼠标按键。
+const TRIGGER_SLOTS: usize = 256 + 5;
+
+/// 输入源到位下标。虚拟键实际不会超过 255, 越界的一律折到最后兜底,
+/// 宁可几个怪键共用一位, 也不能越界。
+fn slot(input: Input) -> usize {
+    match input {
+        Input::Key(vk) => (vk as usize).min(255),
+        Input::Mouse(btn) => 256 + btn as usize,
+    }
+}
+
+fn mark_triggered(input: Input) {
+    TRIGGERED[slot(input)].store(true, Ordering::Relaxed);
+}
+
+fn is_triggered(input: Input) -> bool {
+    TRIGGERED[slot(input)].load(Ordering::Relaxed)
+}
+
+/// 读取并清除标记, 返回原值。
+fn take_triggered(input: Input) -> bool {
+    TRIGGERED[slot(input)].swap(false, Ordering::Relaxed)
 }
 
 // ---------- 钩子回调 ----------
@@ -402,5 +470,31 @@ mod tests {
     #[test]
     fn 忽略无关鼠标消息() {
         assert_eq!(decode_mouse(WM_MOUSEMOVE, 0), None);
+    }
+
+    #[test]
+    fn 键盘与鼠标的槽位不重叠() {
+        // 重叠的话, 按下 Ctrl+某个键之后再点鼠标, 会把别人的记号清掉,
+        // 结果是漏吞一个抬起事件
+        assert_eq!(slot(Input::Key(0)), 0);
+        assert_eq!(slot(Input::Key(255)), 255);
+        assert_eq!(slot(Input::Mouse(MouseButton::Left)), 256);
+        assert!(slot(Input::Mouse(MouseButton::X2)) < TRIGGER_SLOTS);
+    }
+
+    #[test]
+    fn 越界的虚拟键不会写到数组外() {
+        // vkCode 来自系统结构体, 理论上不超过 255, 但越界写入的代价太大, 兜一下底
+        assert!(slot(Input::Key(u16::MAX)) < TRIGGER_SLOTS);
+    }
+
+    #[test]
+    fn 记号取一次就清掉() {
+        let k = Input::Key(200);
+        assert!(!is_triggered(k));
+        mark_triggered(k);
+        assert!(is_triggered(k));
+        assert!(take_triggered(k), "第一次取应当拿到记号");
+        assert!(!take_triggered(k), "第二次就没有了, 否则会连吞两个抬起");
     }
 }

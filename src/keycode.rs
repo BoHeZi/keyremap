@@ -168,3 +168,159 @@ pub fn normalize_for_inject(vk: u16) -> u16 {
         other => other,
     }
 }
+
+// ---------- 组合键输入源的修饰键 ----------
+
+/// `from` 里可以要求按住的修饰键, 按位存放。
+///
+/// 低 4 位是**不分左右**的通用写法 (`Ctrl` = 左右任一按下即算), 高 8 位则指定
+/// 具体某一侧 (`LCtrl` 只认左边那个)。通用写法是常见需求, 分侧写法留给
+/// "右 Alt 当第二功能键"这类布局。
+pub const MOD_CTRL: u16 = 1 << 0;
+pub const MOD_SHIFT: u16 = 1 << 1;
+pub const MOD_ALT: u16 = 1 << 2;
+pub const MOD_WIN: u16 = 1 << 3;
+pub const MOD_LCTRL: u16 = 1 << 4;
+pub const MOD_RCTRL: u16 = 1 << 5;
+pub const MOD_LSHIFT: u16 = 1 << 6;
+pub const MOD_RSHIFT: u16 = 1 << 7;
+pub const MOD_LALT: u16 = 1 << 8;
+pub const MOD_RALT: u16 = 1 << 9;
+pub const MOD_LWIN: u16 = 1 << 10;
+pub const MOD_RWIN: u16 = 1 << 11;
+
+/// 修饰键名 -> 位。写法与键名表一致地大小写不敏感。
+/// 分侧的名字与 [`KEY_TABLE`] 里的一致, 用户不用记两套。
+const MOD_TABLE: &[(&str, u16)] = &[
+    ("Ctrl", MOD_CTRL),
+    ("Control", MOD_CTRL),
+    ("Shift", MOD_SHIFT),
+    ("Alt", MOD_ALT),
+    ("Win", MOD_WIN),
+    ("LCtrl", MOD_LCTRL),
+    ("RCtrl", MOD_RCTRL),
+    ("LShift", MOD_LSHIFT),
+    ("RShift", MOD_RSHIFT),
+    ("LAlt", MOD_LALT),
+    ("RAlt", MOD_RALT),
+    ("LWin", MOD_LWIN),
+    ("RWin", MOD_RWIN),
+];
+
+/// 每个位对应的 (左键, 右键)。通用位两侧都要看, 分侧位只看自己那一侧。
+///
+/// 表里第二项为 `None` 表示这个位只认一侧。
+const MOD_SIDES: &[(u16, u16, Option<u16>)] = &[
+    (MOD_CTRL, VK_LCONTROL, Some(VK_RCONTROL)),
+    (MOD_SHIFT, VK_LSHIFT, Some(VK_RSHIFT)),
+    (MOD_ALT, VK_LMENU, Some(VK_RMENU)),
+    (MOD_WIN, VK_LWIN, Some(VK_RWIN)),
+    (MOD_LCTRL, VK_LCONTROL, None),
+    (MOD_RCTRL, VK_RCONTROL, None),
+    (MOD_LSHIFT, VK_LSHIFT, None),
+    (MOD_RSHIFT, VK_RSHIFT, None),
+    (MOD_LALT, VK_LMENU, None),
+    (MOD_RALT, VK_RMENU, None),
+    (MOD_LWIN, VK_LWIN, None),
+    (MOD_RWIN, VK_RWIN, None),
+];
+
+/// 按名字解析修饰键位。不是修饰键就返回 None。
+pub fn mod_from_name(name: &str) -> Option<u16> {
+    MOD_TABLE
+        .iter()
+        .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        .map(|(_, m)| *m)
+}
+
+/// 位掩码的显示名, 例如 `Ctrl + Shift`。空掩码返回空串。
+pub fn mods_name(mods: u16) -> String {
+    // 固定顺序输出, 与用户在配置里怎么写无关 —— 菜单和日志里同一组修饰键
+    // 始终长一个样, 才好一眼比对。
+    const ORDER: &[(u16, &str)] = &[
+        (MOD_CTRL, "Ctrl"),
+        (MOD_LCTRL, "LCtrl"),
+        (MOD_RCTRL, "RCtrl"),
+        (MOD_SHIFT, "Shift"),
+        (MOD_LSHIFT, "LShift"),
+        (MOD_RSHIFT, "RShift"),
+        (MOD_ALT, "Alt"),
+        (MOD_LALT, "LAlt"),
+        (MOD_RALT, "RAlt"),
+        (MOD_WIN, "Win"),
+        (MOD_LWIN, "LWin"),
+        (MOD_RWIN, "RWin"),
+    ];
+    ORDER
+        .iter()
+        .filter(|(bit, _)| mods & bit != 0)
+        .map(|(_, n)| *n)
+        .collect::<Vec<_>>()
+        .join(" + ")
+}
+
+/// 某个虚拟键此刻是否按着。最高位表示按下状态。
+fn key_down(vk: u16) -> bool {
+    unsafe { GetAsyncKeyState(vk as i32) as u16 & 0x8000 != 0 }
+}
+
+/// 当前是否按住了 `required` 里要求的**全部**修饰键。空掩码恒为真。
+///
+/// 用 `GetAsyncKeyState` 现查, 而不是自己维护一份按下状态。自己记会失步 ——
+/// 钩子装上之前就按住的键、被别的钩子吞掉的抬起事件, 都会让状态卡在"按着",
+/// 而失步的表现是"修饰键像是一直按着", 属于最难排查的那一类问题。
+///
+/// 这个函数在钩子回调里调用, 但**只有触发键先匹配上了才会走到这里**,
+/// 所以一次按键最多几次系统调用, 不构成热路径负担。
+pub fn mods_held(required: u16) -> bool {
+    if required == 0 {
+        return true;
+    }
+    MOD_SIDES.iter().all(|(bit, left, right)| {
+        required & bit == 0 || key_down(*left) || right.is_some_and(key_down)
+    })
+}
+
+/// 释放修饰键时最多要动的键数: 四组修饰键各有左右两侧。
+pub const MAX_MODS: usize = 8;
+
+/// 列出为满足 `required` 而**此刻真正按着**的那些修饰键, 返回 (数组, 有效长度)。
+///
+/// 注意返回的是"实际按着的键", 而不是"位掩码对应的键"。这个区别是本函数存在的
+/// 全部理由:
+///
+/// 以前这里固定返回左侧键 (`VK_LCONTROL` 之类)。用户按的若是**右** Ctrl,
+/// 注入 `LCtrl↑` 毫无作用 —— `VK_CONTROL` 的状态由"左右任一按下"决定, 右边还按着,
+/// 应用照样收到 `Ctrl+Backspace`。更糟的是收尾时那一下 `LCtrl↓`: 它按下了一个
+/// 用户根本没按的键, 等用户松开右 Ctrl 之后, 左 Ctrl 在系统里就一直是按下状态,
+/// 表现为 **Ctrl 卡住**。
+///
+/// 只要按"当前实际按着的键"来松开、再把同样这几个按回去, 两个问题一起消失。
+///
+/// 回填到定长数组而不是 `Vec`: 这个函数在钩子回调里被调用, 那里不能有堆分配。
+pub fn held_mod_vks(required: u16) -> ([u16; MAX_MODS], usize) {
+    let mut out = [0u16; MAX_MODS];
+    let mut n = 0;
+    let push = |vk: u16, out: &mut [u16; MAX_MODS], n: &mut usize| {
+        // 通用位与分侧位可能指向同一个键 (比如同时写了 Ctrl 和 LCtrl), 去个重
+        if !out[..*n].contains(&vk) && *n < MAX_MODS {
+            out[*n] = vk;
+            *n += 1;
+        }
+    };
+
+    for (bit, left, right) in MOD_SIDES {
+        if required & bit == 0 {
+            continue;
+        }
+        if key_down(*left) {
+            push(*left, &mut out, &mut n);
+        }
+        if let Some(r) = right
+            && key_down(*r)
+        {
+            push(*r, &mut out, &mut n);
+        }
+    }
+    (out, n)
+}

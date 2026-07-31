@@ -5,7 +5,10 @@ name = "默认配置"
 # web_url = "https://my-keyremap.pages.dev/"
 
 # 单键映射: from = "..." / to = "..."
-# 组合键映射: to 写成数组, 例如 to = ["Ctrl", "W"]
+# 输出组合键: to 写成数组, 例如 to = ["Ctrl", "W"]
+# 输入组合键: from 写成数组, 最后一个是触发键, 前面是要按住的修饰键,
+#             例如 from = ["Ctrl", "E"] 表示"按住 Ctrl 再按 E"
+#             修饰键只能是 Ctrl / Shift / Alt / Win, 不分左右
 #
 # 用 `keyremap --listen` 查看按下的键叫什么名字 (托盘菜单里也有入口)。
 # 用 `keyremap --dump-keys` 列出全部可用键名。
@@ -47,6 +50,18 @@ name = "E转D"
 group = "文本编辑"
 from = "E"
 to = "D"
+
+# ---- 组合键作为输入源 ----
+# 长按会连发, 所以适合 Backspace / 方向键这类需要连续触发的目标。
+# 注意: 触发时 keyremap 会先松开 Ctrl 再发 Backspace, 否则应用收到的
+# 会是 Ctrl+Backspace (多数编辑器会删掉一整个词)。
+
+[[mappings]]
+name = "Ctrl+E转Backspace"
+comment = "手不用离开主键区就能删字"
+group = "文本编辑"
+from = ["Ctrl", "E"]
+to = "Backspace"
 
 # 上面两条互为反向映射, 同时启用也不会死循环:
 # 注入的按键带有标记, 钩子识别后会直接放行, 不会再次匹配。

@@ -15,6 +15,18 @@
 /** 作为"修饰键"呈现在勾选框里的键。数组顺序即注入顺序。 */
 const MODIFIERS = ['Ctrl', 'Alt', 'Shift', 'LWin'];
 
+// 输入源一侧的修饰键。通用写法 (Ctrl) 表示左右任一按下即算, 分侧写法 (LCtrl)
+// 只认那一边。界面上默认只给四个通用的勾选框, 分侧写法留给手写配置 ——
+// 十二个勾选框会把界面塞满, 而分侧是少数需求。
+const FROM_MODIFIERS = ['Ctrl', 'Alt', 'Shift', 'Win'];
+
+// 识别用的全集: 手写配置里出现 LCtrl 之类时, 得认出它是修饰键而不是触发键,
+// 否则会被当成"两个触发键"而退回原始文本框。
+const FROM_MODIFIERS_ALL = [
+  ...FROM_MODIFIERS,
+  'LCtrl', 'RCtrl', 'LShift', 'RShift', 'LAlt', 'RAlt', 'LWin', 'RWin',
+];
+
 /**
  * 浏览器 KeyboardEvent.code -> 本项目键名。
  *
@@ -145,8 +157,10 @@ function parseToml(text) {
     const value = parseValue(valText);
 
     if (section === 'mapping' && current) {
-      if (key === 'to') current.to = Array.isArray(value) ? value : [value];
-      else if (key in current) current[key] = value;
+      // from 和 to 都可以写成字符串或数组, 统一收成数组
+      if (key === 'to' || key === 'from') {
+        current[key] = Array.isArray(value) ? value : [value];
+      } else if (key in current) current[key] = value;
       else out.warnings.push(`第 ${i + 1} 行: 映射里无法识别的字段 ${key}`);
     } else if (section === 'groups') {
       if (value === false) out.groupEnabled[key] = false;
@@ -170,10 +184,20 @@ function parseToml(text) {
 
 const escStr = (s) => String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"');
 
+/** 键位序列写成 TOML。单个键用字符串形式, 与手写配置的习惯一致。 */
+function keysToToml(field, keys) {
+  const list = (keys || []).filter(Boolean);
+  if (list.length === 0) return '';
+  return list.length === 1
+    ? `${field} = "${escStr(list[0])}"\n`
+    : `${field} = [${list.map((k) => `"${escStr(k)}"`).join(', ')}]\n`;
+}
+
 let nextId = 1;
 function newMapping() {
   // _id 只用于列表渲染的 key，不写进 TOML
-  return { _id: nextId++, name: '', comment: '', enable: true, group: '', from: '', to: [] };
+  // from 与 to 同为数组: 修饰键在前, 触发键/主键在最后一个
+  return { _id: nextId++, name: '', comment: '', enable: true, group: '', from: [], to: [] };
 }
 
 // ---------- 文件句柄的持久化 ----------
@@ -215,6 +239,7 @@ async function idbGet(key) {
 function configApp() {
   return {
     MODIFIERS,
+    FROM_MODIFIERS,
     KEYS: window.KEYREMAP_KEYS || { keys: [], mouse: [] },
     hasFSA: typeof window.showOpenFilePicker === 'function',
 
@@ -259,9 +284,12 @@ function configApp() {
       const seen = new Map();
       const out = [];
       for (const m of this.mappings) {
-        if (!this.isActive(m) || !m.from) continue;
-        if (seen.has(m.from)) out.push([seen.get(m.from), m]);
-        else seen.set(m.from, m);
+        if (!this.isActive(m) || !m.from.length) continue;
+        // 连修饰键一起做键: 与主程序一致, `E` 和 `Ctrl+E` 是两个不同的输入源。
+        // 排序后再拼, 免得 ["Ctrl","Shift","E"] 和 ["Shift","Ctrl","E"] 被当成两个
+        const key = [...m.from].sort().join('+');
+        if (seen.has(key)) out.push([seen.get(key), m]);
+        else seen.set(key, m);
       }
       return out;
     },
@@ -284,10 +312,9 @@ function configApp() {
         if (m.comment) out += `comment = "${escStr(m.comment)}"\n`;
         if (m.enable === false) out += 'enable = false\n';
         if (m.group) out += `group = "${escStr(m.group)}"\n`;
-        out += `from = "${escStr(m.from)}"\n`;
-        out += m.to.length === 1
-          ? `to = "${escStr(m.to[0])}"\n`
-          : `to = [${m.to.map((k) => `"${escStr(k)}"`).join(', ')}]\n`;
+        // 只有一个键时写成字符串, 与手写配置的习惯一致, 也免得平白多出一层方括号
+        out += keysToToml('from', m.from);
+        out += keysToToml('to', m.to);
       }
       return out;
     },
@@ -326,12 +353,49 @@ function configApp() {
       m.to = [...mods, key].filter(Boolean);
     },
 
+    // ---- 输入源 (from) 的编辑 ----
+    //
+    // 和输出侧同一个套路: 修饰键在前, 触发键在最后一个。
+    // 但认的是 FROM_MODIFIERS_ALL —— 输入源这边还可以指定左右某一侧 (LCtrl 等)。
+
+    /** from 能否表示成"若干修饰键 + 一个触发键" */
+    isSimpleFrom(m) {
+      return m.from.filter((k) => !FROM_MODIFIERS_ALL.includes(k)).length === 1;
+    },
+    hasFromMod(m, mod) {
+      return m.from.includes(mod);
+    },
+    fromMain(m) {
+      return m.from.find((k) => !FROM_MODIFIERS_ALL.includes(k)) || '';
+    },
+    /**
+     * 这条映射要显示哪些修饰键勾选框: 四个通用的, 外加它自己用到的分侧修饰键。
+     * 分侧的不默认全列出来 —— 十二个勾选框太占地方, 但已经写在配置里的必须露出来,
+     * 否则用户看不见也取消不掉。
+     */
+    fromModList(m) {
+      const extra = m.from.filter(
+        (k) => FROM_MODIFIERS_ALL.includes(k) && !FROM_MODIFIERS.includes(k),
+      );
+      return [...FROM_MODIFIERS, ...extra];
+    },
+    /** 每次都从当前 from 重算，不依赖任何渲染时的快照 */
+    setFromMod(m, mod, on) {
+      // 用全集过滤, 这样手写的 LCtrl 之类不会因为勾了别的框而被抹掉
+      const mods = FROM_MODIFIERS_ALL.filter((x) => (x === mod ? on : m.from.includes(x)));
+      m.from = [...mods, this.fromMain(m)].filter(Boolean);
+    },
+    setFromMain(m, key) {
+      const mods = FROM_MODIFIERS_ALL.filter((x) => m.from.includes(x));
+      m.from = [...mods, key].filter(Boolean);
+    },
+
     // ---- 条目增删 ----
 
     addMapping() {
       const first = this.KEYS.keys[0] || '';
       const m = newMapping();
-      m.from = first;
+      m.from = [first];
       m.to = [first];
       this.mappings.push(m);
     },
@@ -365,7 +429,9 @@ function configApp() {
     },
 
     finishCapture(key) {
-      if (key && this.captureTarget) this.captureTarget.from = key;
+      // 只改触发键, 已经勾上的修饰键保留 —— 捕获时按 Ctrl 会被浏览器吃掉,
+      // 修饰键本来就得靠勾选框来配
+      if (key && this.captureTarget) this.setFromMain(this.captureTarget, key);
       this.capturing = false;
       this.captureTarget = null;
     },

@@ -12,7 +12,10 @@ use std::path::Path;
 use serde::Deserialize;
 
 use crate::inject::MAX_COMBO;
-use crate::keycode::{Input, input_from_name, name_from_mouse, name_from_vk, vk_from_name};
+use crate::keycode::{
+    Input, MAX_MODS, input_from_name, mod_from_name, mods_name, name_from_mouse, name_from_vk,
+    vk_from_name,
+};
 
 /// 未分组映射在菜单里显示的名字。
 pub const UNGROUPED_LABEL: &str = "未分组";
@@ -52,16 +55,28 @@ struct RawMapping {
     /// 所属组, 不写则归入未分组。组不需要预先声明。
     #[serde(default)]
     group: String,
-    from: String,
-    to: RawOutput,
+    /// 输入源。`from = "Pause"` 或 `from = ["Ctrl", "E"]` (末位是触发键)。
+    from: RawKeys,
+    to: RawKeys,
 }
 
-/// `to` 既可以写成 `to = "Insert"`, 也可以写成 `to = ["Ctrl", "W"]`。
+/// 键位既可以写成 `"Insert"`, 也可以写成 `["Ctrl", "W"]`。
+/// `from` 和 `to` 共用这个形状, 用户就不用记两套写法。
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum RawOutput {
+enum RawKeys {
     Single(String),
     Combination(Vec<String>),
+}
+
+impl RawKeys {
+    /// 统一成切片视角, 省得每处都 match 一遍。
+    fn parts(&self) -> &[String] {
+        match self {
+            RawKeys::Single(s) => std::slice::from_ref(s),
+            RawKeys::Combination(v) => v,
+        }
+    }
 }
 
 fn default_true() -> bool {
@@ -98,7 +113,14 @@ pub struct Mapping {
     /// 所属组在 [`Config::groups`] 中的下标。
     /// 存索引而不是组名: 钩子回调里不能做字符串比较。
     pub group: usize,
+    /// 触发键。写成 `["Ctrl", "E"]` 时这里存的是末位的 `E`。
+    ///
+    /// 修饰键单独放在 [`Mapping::from_mods`] 里, 而不是并进一个序列 ——
+    /// 这样钩子回调的第一步仍然只是一次整数比较, 绝大多数按键在这里就被排除了,
+    /// 根本不会去查修饰键状态。
     pub from: Input,
+    /// 触发前必须按住的修饰键位掩码, 0 表示不要求。见 `keycode::MOD_*`。
+    pub from_mods: u16,
     /// 目标按键序列。长度为 1 表示单键映射, 大于 1 表示组合键。
     pub to: Vec<u16>,
 }
@@ -107,6 +129,11 @@ impl Mapping {
     /// 是否是组合键映射。单键与组合键的触发时机不同, 见 `hook::dispatch`。
     pub fn is_combo(&self) -> bool {
         self.to.len() > 1
+    }
+
+    /// 输入源是否带修饰键 (即 `from` 写成了数组形式)。
+    pub fn has_mods(&self) -> bool {
+        self.from_mods != 0
     }
 
     /// 菜单项与日志里显示的标题。没写 name 时退回映射本身的描述。
@@ -122,9 +149,14 @@ impl Mapping {
     ///
     /// 不叫 from_name 是因为 `from_*` 在 Rust 里通常表示构造函数, clippy 会提醒。
     pub fn input_name(&self) -> String {
-        match self.from {
-            Input::Key(vk) => name_from_vk(vk).unwrap_or("?").to_string(),
-            Input::Mouse(btn) => name_from_mouse(btn).to_string(),
+        let trigger = match self.from {
+            Input::Key(vk) => name_from_vk(vk).unwrap_or("?"),
+            Input::Mouse(btn) => name_from_mouse(btn),
+        };
+        if self.from_mods == 0 {
+            trigger.to_string()
+        } else {
+            format!("{} + {trigger}", mods_name(self.from_mods))
         }
     }
 }
@@ -148,7 +180,11 @@ pub struct Config {
     /// 配置里指定的 Web 工具地址, 空表示用默认值。取值请走 [`Config::web_url`]。
     pub web_url_override: String,
     pub groups: Vec<Group>,
+    /// 按配置文件里的声明顺序存放。菜单、`--dump`、以及托盘按下标切换开关
+    /// 都依赖这个顺序, 所以它不能被重排。
     pub mappings: Vec<Mapping>,
+    /// 钩子回调遍历 [`Config::mappings`] 时使用的下标顺序, 见 [`match_order`]。
+    pub order: Vec<u32>,
 }
 
 impl Config {
@@ -224,7 +260,10 @@ impl Config {
         let mut conflicts = Vec::new();
         for (a, &i) in active.iter().enumerate() {
             for &j in &active[a + 1..] {
-                if self.mappings[i].from == self.mappings[j].from {
+                // 修饰键不同就不算撞车: `E` 和 `Ctrl+E` 是两个不同的输入源
+                if self.mappings[i].from == self.mappings[j].from
+                    && self.mappings[i].from_mods == self.mappings[j].from_mods
+                {
                     conflicts.push((i, j));
                 }
             }
@@ -267,13 +306,9 @@ pub fn parse(content: &str) -> Result<Config, String> {
             format!("映射 \"{}\"", rm.name)
         };
 
-        let from = input_from_name(&rm.from)
-            .ok_or_else(|| format!("{label}: 未知的按键名 \"{}\"", rm.from))?;
+        let (from, from_mods) = parse_from(rm.from.parts(), &label)?;
 
-        let to_names = match rm.to {
-            RawOutput::Single(s) => vec![s],
-            RawOutput::Combination(v) => v,
-        };
+        let to_names = rm.to.parts();
 
         if to_names.is_empty() {
             return Err(format!("{label}: to 不能为空"));
@@ -286,7 +321,7 @@ pub fn parse(content: &str) -> Result<Config, String> {
         }
 
         let mut to = Vec::with_capacity(to_names.len());
-        for name in &to_names {
+        for name in to_names {
             let vk = vk_from_name(name).ok_or_else(|| {
                 format!("{label}: 未知的按键名 \"{name}\" (输出目前只支持键盘按键)")
             })?;
@@ -313,22 +348,82 @@ pub fn parse(content: &str) -> Result<Config, String> {
             enable: rm.enable,
             group,
             from,
+            from_mods,
             to,
         });
     }
 
+    let order = match_order(&mappings);
     Ok(Config {
         name: raw.name,
         web_url_override: raw.web_url,
         groups,
         mappings,
+        order,
     })
+}
+
+/// 解析 `from`: 末位是触发键, 前面的都必须是修饰键。
+///
+/// `from = "Pause"` 与 `from = ["Pause"]` 等价, 都表示不要求修饰键。
+fn parse_from(parts: &[String], label: &str) -> Result<(Input, u16), String> {
+    let Some((trigger_name, mod_names)) = parts.split_last() else {
+        return Err(format!("{label}: from 不能为空"));
+    };
+
+    if mod_names.len() > MAX_MODS {
+        return Err(format!(
+            "{label}: 修饰键最多 {MAX_MODS} 个, 实际 {}",
+            mod_names.len()
+        ));
+    }
+
+    let mut mods = 0u16;
+    for name in mod_names {
+        let bit = mod_from_name(name).ok_or_else(|| {
+            format!(
+                "{label}: \"{name}\" 不是修饰键。数组形式的 from 里, \
+                 除最后一个触发键外只能写 Ctrl / Shift / Alt / Win"
+            )
+        })?;
+        if mods & bit != 0 {
+            return Err(format!("{label}: 修饰键 \"{name}\" 重复了"));
+        }
+        mods |= bit;
+    }
+
+    // 触发键自己不能又是修饰键: `["Ctrl", "Shift"]` 这种写法没有明确含义 ——
+    // 到底是"按住 Ctrl 时按 Shift"还是"同时按住两个"? 直接拒掉, 不猜。
+    if mod_from_name(trigger_name).is_some() {
+        return Err(format!(
+            "{label}: 触发键不能是修饰键 (\"{trigger_name}\"), \
+             修饰键只能写在前面"
+        ));
+    }
+
+    let from = input_from_name(trigger_name)
+        .ok_or_else(|| format!("{label}: 未知的按键名 \"{trigger_name}\""))?;
+    Ok((from, mods))
+}
+
+/// 钩子回调遍历映射时使用的顺序: **修饰键多的排在前面**。
+///
+/// 同时配了 `E -> D` 和 `Ctrl+E -> Backspace` 时, 按住 Ctrl 应当走后者。
+/// 若按声明顺序匹配, 谁写在前面谁生效 —— 那种行为没法向用户解释。
+///
+/// 只影响匹配, 不影响显示: 菜单和 `--dump` 仍按配置文件里的顺序,
+/// 否则用户会发现界面上的条目莫名其妙地重排了。
+/// 用稳定排序, 所以修饰键数量相同的几条仍然保持"先到先得"。
+fn match_order(mappings: &[Mapping]) -> Vec<u32> {
+    let mut order: Vec<u32> = (0..mappings.len() as u32).collect();
+    order.sort_by_key(|&i| std::cmp::Reverse(mappings[i as usize].from_mods.count_ones()));
+    order
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::keycode::MouseButton;
+    use crate::keycode::{MOD_CTRL, MOD_RALT, MOD_SHIFT, MouseButton};
 
     const SAMPLE: &str = r#"
 name = "测试配置"
@@ -367,6 +462,210 @@ to = "E"
         assert!(!cfg.mappings[0].is_combo());
         assert!(cfg.mappings[1].is_combo());
         assert_eq!(cfg.mappings[1].to.len(), 2);
+    }
+
+    // ---- 组合键作为输入源 ----
+
+    /// 只取第一条映射, 省得每个用例都写一遍解包。
+    fn one(toml: &str) -> Mapping {
+        parse(toml).expect("应当解析成功").mappings.remove(0)
+    }
+
+    #[test]
+    fn 数组形式的from末位是触发键() {
+        let m = one(r#"[[mappings]]
+from = ["Ctrl", "E"]
+to = "Backspace""#);
+        assert_eq!(m.from, Input::Key(vk_from_name("E").unwrap()));
+        assert_eq!(m.from_mods, MOD_CTRL);
+        assert!(m.has_mods());
+    }
+
+    #[test]
+    fn 多个修饰键合并成位掩码() {
+        let m = one(r#"[[mappings]]
+from = ["Ctrl", "Shift", "E"]
+to = "Backspace""#);
+        assert_eq!(m.from_mods, MOD_CTRL | MOD_SHIFT);
+        // 显示名按固定顺序, 与用户写的顺序无关
+        assert_eq!(m.input_name(), "Ctrl + Shift + E");
+    }
+
+    #[test]
+    fn 修饰键顺序不影响结果() {
+        let a = one(r#"[[mappings]]
+from = ["Shift", "Ctrl", "E"]
+to = "Backspace""#);
+        let b = one(r#"[[mappings]]
+from = ["Ctrl", "Shift", "E"]
+to = "Backspace""#);
+        assert_eq!(a.from_mods, b.from_mods);
+        assert_eq!(a.input_name(), b.input_name());
+    }
+
+    #[test]
+    fn 单元素数组等价于字符串写法() {
+        let a = one("[[mappings]]\nfrom = [\"Pause\"]\nto = \"Insert\"");
+        let b = one("[[mappings]]\nfrom = \"Pause\"\nto = \"Insert\"");
+        assert_eq!(a.from, b.from);
+        assert_eq!(a.from_mods, 0);
+        assert!(!a.has_mods());
+    }
+
+    #[test]
+    fn 触发键可以是鼠标键() {
+        let m = one(r#"[[mappings]]
+from = ["Ctrl", "MouseX2"]
+to = ["Ctrl", "Shift", "T"]"#);
+        assert_eq!(m.from, Input::Mouse(MouseButton::X2));
+        assert_eq!(m.from_mods, MOD_CTRL);
+        assert_eq!(m.input_name(), "Ctrl + MouseX2");
+    }
+
+    #[test]
+    fn 可以指定左右某一侧() {
+        let m = one(r#"[[mappings]]
+from = ["RAlt", "E"]
+to = "Backspace""#);
+        assert_eq!(m.from_mods, MOD_RALT);
+        assert_eq!(m.input_name(), "RAlt + E");
+    }
+
+    #[test]
+    fn 通用写法与分侧写法是不同的要求() {
+        let generic = one("[[mappings]]\nfrom = [\"Ctrl\", \"E\"]\nto = \"Backspace\"");
+        let left = one("[[mappings]]\nfrom = [\"LCtrl\", \"E\"]\nto = \"Backspace\"");
+        assert_ne!(generic.from_mods, left.from_mods);
+        // 触发键相同但要求不同, 所以不算冲突
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = ["Ctrl", "E"]
+to = "Backspace"
+
+[[mappings]]
+from = ["LCtrl", "E"]
+to = "Delete"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.find_conflicts().is_empty());
+    }
+
+    #[test]
+    fn 非修饰键写在前面要报错() {
+        let e = parse("[[mappings]]\nfrom = [\"A\", \"E\"]\nto = \"Backspace\"").unwrap_err();
+        assert!(e.contains("不是修饰键"), "错误信息要指出问题: {e}");
+    }
+
+    #[test]
+    fn 触发键是修饰键要报错() {
+        // ["Ctrl", "Shift"] 含义不明: 是"按住 Ctrl 时按 Shift"还是同时按住?
+        // 与其猜, 不如直接拒掉
+        let e =
+            parse("[[mappings]]\nfrom = [\"Ctrl\", \"Shift\"]\nto = \"Backspace\"").unwrap_err();
+        assert!(e.contains("触发键不能是修饰键"), "{e}");
+    }
+
+    #[test]
+    fn 重复的修饰键要报错() {
+        let e = parse("[[mappings]]\nfrom = [\"Ctrl\", \"Ctrl\", \"E\"]\nto = \"Backspace\"")
+            .unwrap_err();
+        assert!(e.contains("重复"), "{e}");
+    }
+
+    #[test]
+    fn 修饰键多的排在匹配顺序前面() {
+        // 声明顺序故意反着写: 无修饰的在前
+        let cfg = parse(
+            r#"
+[[mappings]]
+name = "无修饰"
+from = "E"
+to = "D"
+
+[[mappings]]
+name = "带一个"
+from = ["Ctrl", "E"]
+to = "Backspace"
+
+[[mappings]]
+name = "带两个"
+from = ["Ctrl", "Shift", "E"]
+to = "Delete"
+"#,
+        )
+        .unwrap();
+
+        // 显示顺序保持配置文件里的样子
+        assert_eq!(cfg.mappings[0].name, "无修饰");
+        assert_eq!(cfg.mappings[2].name, "带两个");
+
+        // 匹配顺序则是修饰键多的优先, 否则 `E -> D` 会把 `Ctrl+E` 挡住
+        let names: Vec<&str> = cfg
+            .order
+            .iter()
+            .map(|&i| cfg.mappings[i as usize].name.as_str())
+            .collect();
+        assert_eq!(names, vec!["带两个", "带一个", "无修饰"]);
+    }
+
+    #[test]
+    fn 修饰键数量相同的仍按声明顺序() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+name = "先"
+from = ["Ctrl", "E"]
+to = "Backspace"
+
+[[mappings]]
+name = "后"
+from = ["Alt", "R"]
+to = "Delete"
+"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = cfg
+            .order
+            .iter()
+            .map(|&i| cfg.mappings[i as usize].name.as_str())
+            .collect();
+        assert_eq!(names, vec!["先", "后"], "稳定排序应保持先到先得");
+    }
+
+    #[test]
+    fn 修饰键不同不算输入源冲突() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "E"
+to = "D"
+
+[[mappings]]
+from = ["Ctrl", "E"]
+to = "Backspace"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.find_conflicts().is_empty(), "E 和 Ctrl+E 是两个输入源");
+    }
+
+    #[test]
+    fn 修饰键相同才算冲突() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = ["Ctrl", "E"]
+to = "Backspace"
+
+[[mappings]]
+from = ["Ctrl", "E"]
+to = "Delete"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.find_conflicts(), vec![(0, 1)]);
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod autostart;
 mod config;
 mod console;
 mod elevate;
+mod foreground;
 mod hook;
 mod inject;
 mod keycode;
@@ -121,6 +122,7 @@ fn main() {
 
         info!("=== 监听模式: 按键只显示不映射 ===");
         info!("按 Ctrl+C 或关闭本窗口退出");
+        info!("切换到别的程序会报出它的进程名, 那就是 window = \"...\" 该填的值");
         info!("提示: 本窗口已关闭快速编辑, 想复制文字请用右键菜单里的\"标记\"");
 
         hook::set_listen_only(true);
@@ -132,8 +134,14 @@ fn main() {
             error!("{e}");
             return;
         }
+        // 顺带跟踪前台窗口。监听模式的用处就是"查名字", 而按程序限定映射时
+        // 要查的正是进程名 —— 没有它, 用户只能去任务管理器里连蒙带猜。
+        if let Err(e) = foreground::sync() {
+            warn!("{e}");
+        }
         hook::run_message_loop();
         hook::uninstall();
+        foreground::uninstall();
         return;
     }
 
@@ -221,6 +229,15 @@ fn main() {
         std::process::exit(1);
     }
 
+    // 前台窗口监视。和低级钩子一样必须在**本线程**装 —— 它的回调也是由系统
+    // 投递到安装线程的消息队列、再由消息泵派发的。配置里没有按程序限定的映射
+    // 时 sync 什么都不做, 所以这句可以无条件调用。
+    //
+    // 失败不致命: 那些映射会退化成"不生效", 其余照常工作, 比整个起不来强。
+    if let Err(e) = foreground::sync() {
+        warn!("{e}");
+    }
+
     // 让自启机制与"以管理员启动"偏好保持一致。
     // 用户刚打开该偏好时还没有权限建计划任务, 提权重启后由这里补上,
     // 并把旧的 Run 项清掉。幂等, 已经一致时不做任何写入。
@@ -251,6 +268,7 @@ fn main() {
     run_app_loop();
     tray::shutdown();
     hook::uninstall();
+    foreground::uninstall();
 
     // 提权重启必须放在释放单实例锁之后, 否则新实例会被自己的旧锁挡在门外。
     if tray::take_restart_request() {
@@ -388,6 +406,11 @@ fn run_app_loop() {
             // 必须在**这个**线程做: 低级钩子绑定在安装它的线程上, 而重载是
             // 文件监听线程发起的, 在那边装出来的钩子永远不会被回调。
             if let Err(e) = hook::sync_mouse_hook() {
+                warn!("{e}");
+            }
+            // 前台窗口监视同理: 新配置里可能刚出现 (或刚消失) 按程序限定的映射。
+            // 规则表本身已经在 hook::set_config 里换好了, 这里只管钩子的装卸。
+            if let Err(e) = foreground::sync() {
                 warn!("{e}");
             }
             tray::update_status();

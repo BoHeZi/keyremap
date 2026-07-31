@@ -52,17 +52,26 @@
 
   <template x-for="m in mappings" :key="m._id">
     <div class="mapping" :class="{ inactive: !isActive(m), conflict: isConflicted(m) }">
-      <div class="field">
+      <div class="field a-name">
         <label>名称</label>
         <input type="text" x-model="m.name" placeholder="可留空">
       </div>
 
-      <div class="field">
+      <div class="field a-group">
         <label>组</label>
         <input type="text" x-model="m.group" placeholder="未分组" list="group-list">
       </div>
 
-      <div class="field">
+      <div class="field a-window">
+        <label>生效程序</label>
+        <!-- 填进程的可执行文件名。加 ! 前缀表示"除了它", 逗号分隔可以写多个。
+             进程名从「按键监听」窗口里抄 —— 切换程序时它会报出来 -->
+        <input type="text" :value="windowText(m)"
+               @input="setWindowText(m, $event.target.value)"
+               placeholder="不限" title="留空=所有程序。例: chrome.exe, msedge.exe 或 !code.exe">
+      </div>
+
+      <div class="field a-from">
         <label>输入 (from)</label>
         <!-- 勾上修饰键就变成"按住它们再按触发键", 例如 Ctrl + E -->
         <template x-if="isSimpleFrom(m)">
@@ -104,7 +113,7 @@
         </template>
       </div>
 
-      <div class="field">
+      <div class="field a-to">
         <label>输出 (to)</label>
         <!-- 勾上"屏蔽"就是吞掉这个输入、什么都不发出, 用来防误触。
              外面套一层 .mods 是为了复用修饰键勾选框的那套排版 -->
@@ -142,12 +151,13 @@
         </template>
       </div>
 
-      <label class="toggle">
-        <input type="checkbox" x-model="m.enable">
-        <span>启用</span>
-      </label>
-
-      <button class="icon" @click="removeMapping(m)">删除</button>
+      <div class="a-actions">
+        <label class="toggle">
+          <input type="checkbox" x-model="m.enable">
+          <span>启用</span>
+        </label>
+        <button class="icon" @click="removeMapping(m)">删除</button>
+      </div>
     </div>
   </template>
 

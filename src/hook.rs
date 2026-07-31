@@ -29,6 +29,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 };
 
 use crate::config::Config;
+use crate::foreground;
 use crate::inject::{self, INJECTED_TAG};
 use crate::keycode::{Input, MOD_CAPS, MouseButton, mods_held, name_from_mouse, name_from_vk};
 
@@ -41,13 +42,22 @@ static ENABLED: AtomicBool = AtomicBool::new(true);
 /// 监听模式: 只打印不拦截, 用于让用户查出某个键叫什么名字。
 static LISTEN_ONLY: AtomicBool = AtomicBool::new(false);
 
+/// 监听模式要打印的事件。
+enum ListenEvent {
+    /// 按下或抬起了某个键 / 鼠标按钮。
+    Input(Input, bool),
+    /// 前台切到了哪个程序。这条是给 `window = "..."` 用的 ——
+    /// 用户得先知道进程名叫什么, 才写得出按程序限定的映射。
+    Foreground(String),
+}
+
 /// 监听模式的事件出口。回调只往这里投递, 格式化与打印都在另一个线程做。
 ///
 /// **为什么不能在回调里直接打印**: 控制台一旦被鼠标选中 (快速编辑模式),
 /// `WriteConsole` 会一直阻塞到选区被取消。而钩子回调阻塞意味着**全系统的输入**
 /// 都在等它 —— 表现是整台机器卡死, 而不是只有本程序卡住。
 /// 顺带也躲开了回调里的堆分配 (键名 `to_string`)。
-static LISTEN_TX: OnceLock<SyncSender<(Input, bool)>> = OnceLock::new();
+static LISTEN_TX: OnceLock<SyncSender<ListenEvent>> = OnceLock::new();
 
 /// 队列满时丢弃的事件数。丢几条日志远好过卡住整个系统的输入。
 static LISTEN_DROPPED: AtomicUsize = AtomicUsize::new(0);
@@ -69,6 +79,13 @@ pub fn set_config(config: Config) {
             // 闸门必须跟着一起换, 否则新加的映射会在第一道关卡就被放行,
             // 而删掉的映射对应的键还在白白往下走
             refresh_gate(&config);
+            // 窗口规则表同理, 而且更要紧: 位掩码里的每一位对应规则表里的一条,
+            // 换了配置却没重算, 位的含义就和 `Mapping::window_bit` 对不上了 ——
+            // 表现是映射在错误的程序里生效。紧挨着换, 把不一致的窗口压到最小。
+            //
+            // 这里只换数据, 不碰 WinEvent 钩子的安装状态: 那必须在主线程做,
+            // 而本函数也会被文件监听线程调用。装卸交给 `foreground::sync`。
+            foreground::set_rules(&config);
             *guard = Arc::new(config);
         }
         Err(e) => warn!("配置更新失败, 锁已中毒: {e}"),
@@ -137,26 +154,47 @@ pub fn set_listen_only(on: bool) {
     LISTEN_ONLY.store(on, Ordering::Relaxed);
 }
 
+/// 监听模式是否开着。`foreground::sync` 据此决定要不要跟踪前台窗口 ——
+/// 那种模式下没有配置可查, 但恰恰最需要报出程序名。
+pub fn is_listen_only() -> bool {
+    LISTEN_ONLY.load(Ordering::Relaxed)
+}
+
 /// 启动监听模式的打印线程。必须在装钩子之前调用, 否则最初几个事件没人接。
 ///
 /// 把格式化和写控制台都挪到这个线程, 是为了让钩子回调无论如何都能立刻返回 ——
 /// 见 [`LISTEN_TX`] 的说明。
 pub fn start_listen_printer() {
-    let (tx, rx) = sync_channel::<(Input, bool)>(LISTEN_QUEUE);
+    let (tx, rx) = sync_channel::<ListenEvent>(LISTEN_QUEUE);
     if LISTEN_TX.set(tx).is_err() {
         return; // 已经启动过了
     }
 
     std::thread::spawn(move || {
         let mut reported = 0usize;
-        for (input, is_down) in rx {
-            let name = match input {
-                Input::Key(vk) => name_from_vk(vk)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| format!("未知键(VK=0x{vk:02X})")),
-                Input::Mouse(btn) => name_from_mouse(btn).to_string(),
-            };
-            info!("{name}  [{}]", if is_down { "按下" } else { "抬起" });
+        for event in rx {
+            match event {
+                ListenEvent::Foreground(process) => {
+                    info!(
+                        "--- 前台程序: {} ---",
+                        if process.is_empty() {
+                            "(识别不出来)"
+                        } else {
+                            &process
+                        }
+                    );
+                    continue;
+                }
+                ListenEvent::Input(input, is_down) => {
+                    let name = match input {
+                        Input::Key(vk) => name_from_vk(vk)
+                            .map(str::to_string)
+                            .unwrap_or_else(|| format!("未知键(VK=0x{vk:02X})")),
+                        Input::Mouse(btn) => name_from_mouse(btn).to_string(),
+                    };
+                    info!("{name}  [{}]", if is_down { "按下" } else { "抬起" });
+                }
+            }
 
             // 丢过事件就说一句。不说的话用户会以为自己没按到。
             let dropped = LISTEN_DROPPED.load(Ordering::Relaxed);
@@ -182,9 +220,23 @@ fn report(input: Input, is_down: bool) {
         return;
     }
     if let Some(tx) = LISTEN_TX.get()
-        && let Err(TrySendError::Full(_)) = tx.try_send((input, is_down))
+        && let Err(TrySendError::Full(_)) = tx.try_send(ListenEvent::Input(input, is_down))
     {
         LISTEN_DROPPED.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+/// 监听模式下报告前台程序换成了谁, 供 `foreground` 调用。
+///
+/// 与 [`report`] 走同一个通道和同一条纪律: 只投递, 不打印。它虽然不是从低级钩子
+/// 回调里调的 (来源是 WinEvent 回调), 但两者跑在同一个线程上 —— 在这里被控制台
+/// 卡住, 一样会让按键事件排不上队。
+pub fn report_foreground(process: String) {
+    if !LISTEN_ONLY.load(Ordering::Relaxed) {
+        return;
+    }
+    if let Some(tx) = LISTEN_TX.get() {
+        let _ = tx.try_send(ListenEvent::Foreground(process));
     }
 }
 
@@ -218,11 +270,20 @@ fn dispatch(input: Input, is_down: bool) -> bool {
     //
     // 不能只靠重新匹配一遍: 用户完全可能先松开 Ctrl 再松开 E, 那时修饰键
     // 条件已经不成立, 重新匹配会失败, 于是一个没有配对按下的 E 抬起漏给应用。
+    //
+    // 这里**刻意不看窗口条件**: 按下时若因窗口匹配而被吞掉, 哪怕按住期间切换了
+    // 程序 (Alt+Tab 就会), 抬起也必须一并吞掉。否则应用会收到一个没有配对按下的
+    // 抬起事件, 有些程序会因此认为该键卡住了。记号在则吞, 不问缘由。
     if !is_down && take_triggered(input) {
         return true;
     }
 
-    // 按 config.order 遍历: 修饰键多的排在前面, 这样 `Ctrl+E` 能盖过 `E`。
+    // 当前前台进程满足哪些窗口条件。一次 relaxed 原子读, 循环外取一次就够 ——
+    // 真正的进程查询发生在前台切换时, 见 foreground 模块。
+    let windows = foreground::active_rules();
+
+    // 按 config.order 遍历: 条件更具体的排在前面, 这样 `Ctrl+E` 能盖过 `E`、
+    // 限定了程序的能盖过通用的。
     for &i in &config.order {
         let Some(m) = config.mappings.get(i as usize) else {
             continue;
@@ -230,6 +291,11 @@ fn dispatch(input: Input, is_down: bool) -> bool {
         // 先比触发键 —— 一次整数比较, 绝大多数按键在这一步就被排除,
         // 根本不会去查修饰键状态。is_active 也只是一次数组索引。
         if m.from != input || !config.is_active(m) {
+            continue;
+        }
+        // 限定了程序的映射, 只在条件成立时参与匹配。一次 & 而已 ——
+        // 进程名的字符串比较早在前台切换时就做完了。
+        if m.window_bit != 0 && m.window_bit & windows == 0 {
             continue;
         }
         // CapsLock 得单独问我们自己那份记录, 不能去问系统。
@@ -323,10 +389,16 @@ fn handle_caps(config: &Config, is_down: bool) -> bool {
     }
 
     // 单独轻点: 有没有专门给 CapsLock 配的映射?
+    let windows = foreground::active_rules();
     for &i in &config.order {
         let Some(m) = config.mappings.get(i as usize) else {
             continue;
         };
+        // 窗口条件同样要看 —— 漏了这一句, 一条限定在某程序里的 `CapsLock -> Esc`
+        // 会在所有程序里都生效, 而这里恰恰是它唯一的触发点。
+        if m.window_bit != 0 && m.window_bit & windows == 0 {
+            continue;
+        }
         if m.from == Input::Key(VK_CAPITAL) && !m.has_mods() && config.is_active(m) {
             if !m.is_block() {
                 inject::send_combination(&m.to);

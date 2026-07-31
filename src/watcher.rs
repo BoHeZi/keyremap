@@ -87,8 +87,10 @@ pub fn reload_now(path: &Path) -> Result<usize, String> {
     let cfg = config::load(path)?;
     let n = cfg.active_count();
     config::warn_conflicts(&cfg);
+    // 先换配置 (顺带换掉窗口规则表), 再让两个"按需安装"的钩子跟上
     hook::set_config(cfg);
     hook::sync_mouse_hook()?;
+    crate::foreground::sync()?;
     Ok(n)
 }
 

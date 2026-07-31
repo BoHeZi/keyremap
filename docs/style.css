@@ -118,9 +118,16 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 
 /* ---- 映射卡片 ---- */
 
+/* 两行的固定分区: 上行是"这条映射是什么"(名称/组/生效程序/开关),
+   下行是映射本身(输入 -> 输出)。
+   用 grid-template-areas 而不是让元素按顺序流入格子 —— 后者在字段增减时会
+   悄悄错位, 而这几个字段本来就是分两类的, 说清楚比省几行 CSS 值。 */
 .mapping {
   display: grid;
-  grid-template-columns: minmax(0, 1.4fr) minmax(0, 1fr) minmax(0, 1.6fr) auto auto;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr) minmax(0, 1.2fr) auto;
+  grid-template-areas:
+    "name group window actions"
+    "from from   to     to";
   gap: .6rem;
   align-items: end;
   padding: .8rem;
@@ -128,6 +135,19 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
   border: 1px solid var(--border);
   border-radius: 7px;
   background: var(--panel);
+}
+
+.a-name { grid-area: name; }
+.a-group { grid-area: group; }
+.a-window { grid-area: window; }
+.a-from { grid-area: from; }
+.a-to { grid-area: to; }
+
+.a-actions {
+  grid-area: actions;
+  display: flex;
+  align-items: center;
+  gap: .6rem;
 }
 .mapping.inactive { opacity: .55; }
 .mapping.conflict { border-color: var(--warn-border); background: var(--warn-bg); }
@@ -146,7 +166,14 @@ input:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1
 .toggle { display: flex; align-items: center; gap: .3rem; font-size: .85rem; white-space: nowrap; }
 
 @media (max-width: 780px) {
-  .mapping { grid-template-columns: 1fr 1fr; }
+  .mapping {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "name   group"
+      "window actions"
+      "from   from"
+      "to     to";
+  }
 }
 
 /* ---- 组 ---- */

@@ -22,6 +22,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_System_Console",    # 按需附加控制台
     "Win32_Storage_FileSystem", # CreateFileW: 重新打开 CONOUT$/CONIN$
     "Win32_UI_HiDpi",          # SetProcessDpiAwarenessContext: 菜单与图标不发虚
+    "Win32_UI_Accessibility",  # SetWinEventHook: 跟踪前台窗口, 按程序区分映射
     "Win32_Security",          # CreateMutexW 参数类型 / 提权状态检测
     "Win32_System_Registry",   # 开机自启动: HKCU\...\Run
 ] }

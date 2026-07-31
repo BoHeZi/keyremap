@@ -8,6 +8,8 @@
 #
 # 想知道某个键叫什么名字: 托盘菜单 -> "按键监听", 或者 keyremap --listen
 # 想看全部可用键名:       keyremap --dump-keys
+#
+# 按键监听同时也会报出当前前台程序的名字, 那正是下面 window = "..." 该填的值。
 
 name = "我的配置"
 
@@ -42,3 +44,18 @@ name = "我的配置"
 # name = "Ctrl+E转Backspace"
 # from = ["Ctrl", "E"]
 # to = "Backspace"
+#
+# 加上 window 就只在指定的程序里生效。填进程的可执行文件名, 不分大小写;
+# 加 ! 前缀表示"除了它", 也可以写成数组列举多个:
+#
+# [[mappings]]
+# name = "浏览器侧键后退"
+# from = "MouseX2"
+# to = ["Alt", "Left"]
+# window = ["chrome.exe", "msedge.exe"]
+#
+# [[mappings]]
+# name = "终端里别抢这个键"
+# from = ["CapsLock", "H"]
+# to = "Left"
+# window = "!windowsterminal.exe"

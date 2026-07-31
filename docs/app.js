@@ -158,8 +158,8 @@ function parseToml(text) {
     const value = parseValue(valText);
 
     if (section === 'mapping' && current) {
-      // from 和 to 都可以写成字符串或数组, 统一收成数组
-      if (key === 'to' || key === 'from') {
+      // from / to / window 都可以写成字符串或数组, 统一收成数组
+      if (key === 'to' || key === 'from' || key === 'window') {
         current[key] = Array.isArray(value) ? value : [value];
       } else if (key in current) current[key] = value;
       else out.warnings.push(`第 ${i + 1} 行: 映射里无法识别的字段 ${key}`);
@@ -203,7 +203,17 @@ let nextId = 1;
 function newMapping() {
   // _id 只用于列表渲染的 key，不写进 TOML
   // from 与 to 同为数组: 修饰键在前, 触发键/主键在最后一个
-  return { _id: nextId++, name: '', comment: '', enable: true, group: '', from: [], to: [] };
+  // window: 限定生效的程序, 空数组表示不限
+  return {
+    _id: nextId++,
+    name: '',
+    comment: '',
+    enable: true,
+    group: '',
+    from: [],
+    to: [],
+    window: [],
+  };
 }
 
 // ---------- 文件句柄的持久化 ----------
@@ -321,6 +331,10 @@ function configApp() {
         // 只有一个键时写成字符串, 与手写配置的习惯一致, 也免得平白多出一层方括号
         out += keysToToml('from', m.from);
         out += keysToToml('to', m.to);
+        // window 与 to 不同: 空表示"不限程序", 整行省略即可。
+        // 写成 `window = []` 虽然主程序也认, 但那等于把默认值写死在文件里, 没必要
+        const win = (m.window || []).filter(Boolean);
+        if (win.length) out += keysToToml('window', win);
       }
       return out;
     },
@@ -335,6 +349,23 @@ function configApp() {
 
     countInGroup(g) {
       return this.mappings.filter((m) => m.group === g).length;
+    },
+
+    // ---- 生效程序 (window) ----
+
+    /**
+     * 用逗号分隔的文本来编辑, 而不是给每个程序名做一个标签控件。
+     * 这里的值多半是从「按键监听」窗口里抄来的进程名, 直接粘贴最省事。
+     */
+    windowText(m) {
+      return (m.window || []).join(', ');
+    },
+
+    setWindowText(m, text) {
+      m.window = text
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean);
     },
 
     // ---- 输出 (to) 的编辑 ----

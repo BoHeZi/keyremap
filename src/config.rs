@@ -11,6 +11,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use crate::foreground::{MAX_WINDOW_RULES, WindowRule};
 use crate::inject::MAX_COMBO;
 use crate::keycode::{
     Input, MAX_MODS, MOD_CAPS, input_from_name, mod_from_name, mods_name, name_from_mouse,
@@ -56,25 +57,31 @@ struct RawMapping {
     #[serde(default)]
     group: String,
     /// 输入源。`from = "Pause"` 或 `from = ["Ctrl", "E"]` (末位是触发键)。
-    from: RawKeys,
-    to: RawKeys,
+    from: RawList,
+    to: RawList,
+    /// 限定在哪些程序里生效。不写则不限。
+    ///
+    /// `window = "chrome.exe"` 只在 Chrome 里; `window = "!code.exe"` 除 VSCode
+    /// 之外都生效; 也可以写成数组。语义见 [`crate::foreground::WindowRule`]。
+    #[serde(default)]
+    window: Option<RawList>,
 }
 
-/// 键位既可以写成 `"Insert"`, 也可以写成 `["Ctrl", "W"]`。
-/// `from` 和 `to` 共用这个形状, 用户就不用记两套写法。
+/// 既可以写成 `"Insert"`, 也可以写成 `["Ctrl", "W"]`。
+/// `from` / `to` / `window` 共用这个形状, 用户就不用记好几套写法。
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
-enum RawKeys {
+enum RawList {
     Single(String),
     Combination(Vec<String>),
 }
 
-impl RawKeys {
+impl RawList {
     /// 统一成切片视角, 省得每处都 match 一遍。
     fn parts(&self) -> &[String] {
         match self {
-            RawKeys::Single(s) => std::slice::from_ref(s),
-            RawKeys::Combination(v) => v,
+            RawList::Single(s) => std::slice::from_ref(s),
+            RawList::Combination(v) => v,
         }
     }
 }
@@ -123,6 +130,13 @@ pub struct Mapping {
     pub from_mods: u16,
     /// 目标按键序列。长度为 1 表示单键映射, 大于 1 表示组合键。
     pub to: Vec<u16>,
+    /// 窗口条件在 [`Config::window_rules`] 里对应的那一位, **0 表示不限程序**。
+    ///
+    /// 存位而不是存索引, 是为了让钩子回调的判断退化成一次 `&`:
+    /// `m.window_bit & foreground::active_rules() != 0`。存索引的话还要先移位。
+    pub window_bit: u64,
+    /// 窗口条件的原样写法, 只用于显示 (菜单、`--dump`)。不限程序时是空串。
+    pub window_label: String,
 }
 
 impl Mapping {
@@ -150,6 +164,11 @@ impl Mapping {
         }
     }
 
+    /// 是否限定了生效的程序。
+    pub fn has_window(&self) -> bool {
+        self.window_bit != 0
+    }
+
     /// 输入源的显示名。
     ///
     /// 不叫 from_name 是因为 `from_*` 在 Rust 里通常表示构造函数, clippy 会提醒。
@@ -170,15 +189,22 @@ impl fmt::Display for Mapping {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let from = self.input_name();
         if self.is_block() {
-            return write!(f, "{from} -> (屏蔽)");
+            write!(f, "{from} -> (屏蔽)")?;
+        } else {
+            let to = self
+                .to
+                .iter()
+                .map(|vk| name_from_vk(*vk).unwrap_or("?"))
+                .collect::<Vec<_>>()
+                .join(" + ");
+            write!(f, "{from} -> {to}")?;
         }
-        let to = self
-            .to
-            .iter()
-            .map(|vk| name_from_vk(*vk).unwrap_or("?"))
-            .collect::<Vec<_>>()
-            .join(" + ");
-        write!(f, "{from} -> {to}")
+        // 限定了程序就一定要显示出来, 否则用户在别的程序里发现它"不工作"时
+        // 从菜单和 --dump 上完全看不出原因
+        if !self.window_label.is_empty() {
+            write!(f, " @{}", self.window_label)?;
+        }
+        Ok(())
     }
 }
 
@@ -196,6 +222,13 @@ pub struct Config {
     /// 是否有映射把 CapsLock 当修饰键。有的话钩子要吞掉它的按下事件,
     /// 否则按一次 CapsLock+H 会顺带把大小写切了。
     pub uses_caps_mod: bool,
+    /// 去重后的窗口条件表, 下标即 [`Mapping::window_bit`] 里的位号。
+    ///
+    /// 去重是有意义的: 一份配置里往往好几条映射共用同一个 `window = "chrome.exe"`,
+    /// 合并之后前台切换时只需判断一次, 位掩码也省得早早用满 64 位。
+    pub window_rules: Vec<WindowRule>,
+    /// 是否有映射限定了程序。没有就不去装前台窗口监视, 见 `foreground::sync`。
+    pub uses_window: bool,
 }
 
 impl Config {
@@ -259,6 +292,11 @@ impl Config {
     ///
     /// 只检查**同时生效**的条目: 用两个互斥的组切换同一个键的不同映射
     /// (比如"游戏模式"和"办公模式") 是合理用法, 只要它们不同时启用就不算冲突。
+    ///
+    /// 窗口条件不同的两条同样不算冲突 —— "浏览器里侧键是后退、编辑器里是撤销"
+    /// 正是按程序区分映射的典型用法。这里只比条件是否**完全相同**, 所以
+    /// `["a.exe","b.exe"]` 与 `["b.exe"]` 这种部分重叠不会被报出来: 判断两个
+    /// 集合是否相交要枚举所有进程名, 做不到, 宁可漏报也不误报。
     pub fn find_conflicts(&self) -> Vec<(usize, usize)> {
         let active: Vec<usize> = self
             .mappings
@@ -274,6 +312,7 @@ impl Config {
                 // 修饰键不同就不算撞车: `E` 和 `Ctrl+E` 是两个不同的输入源
                 if self.mappings[i].from == self.mappings[j].from
                     && self.mappings[i].from_mods == self.mappings[j].from_mods
+                    && self.mappings[i].window_bit == self.mappings[j].window_bit
                 {
                     conflicts.push((i, j));
                 }
@@ -308,6 +347,7 @@ pub fn parse(content: &str) -> Result<Config, String> {
 
     let mut groups: Vec<Group> = Vec::new();
     let mut mappings = Vec::with_capacity(raw.mappings.len());
+    let mut window_rules: Vec<WindowRule> = Vec::new();
 
     for (i, rm) in raw.mappings.into_iter().enumerate() {
         // 报错时带上条目序号和名字, 方便定位是哪一条写错了
@@ -338,6 +378,11 @@ pub fn parse(content: &str) -> Result<Config, String> {
             to.push(vk);
         }
 
+        let (window_bit, window_label) = match &rm.window {
+            Some(w) => intern_window_rule(w.parts(), &mut window_rules, &label)?,
+            None => (0, String::new()),
+        };
+
         // 组按首次出现的顺序登记, 不需要预先声明。
         // 启用状态取 [groups] 里的设置, 没写就默认启用。
         let group = match groups.iter().position(|g| g.name == rm.group) {
@@ -360,11 +405,14 @@ pub fn parse(content: &str) -> Result<Config, String> {
             from,
             from_mods,
             to,
+            window_bit,
+            window_label,
         });
     }
 
     let order = match_order(&mappings);
     let uses_caps_mod = mappings.iter().any(|m| m.from_mods & MOD_CAPS != 0);
+    let uses_window = !window_rules.is_empty();
     Ok(Config {
         name: raw.name,
         web_url_override: raw.web_url,
@@ -372,7 +420,89 @@ pub fn parse(content: &str) -> Result<Config, String> {
         mappings,
         order,
         uses_caps_mod,
+        window_rules,
+        uses_window,
     })
+}
+
+/// 把 `window = [...]` 编译成规则表里的一位, 相同的条件会合并到同一位上。
+///
+/// 返回 (位, 显示用的原样写法)。
+///
+/// 这里做的事情和把键名编译成虚拟键码是同一性质: 用户写的是字符串, 但判断发生在
+/// 钩子回调里 —— 那里既不能比字符串, 也不能查进程。所以把"哪些程序"预先编号,
+/// 运行期只剩位运算, 由 `foreground` 负责在前台切换时维护"此刻哪几位成立"。
+fn intern_window_rule(
+    parts: &[String],
+    rules: &mut Vec<WindowRule>,
+    label: &str,
+) -> Result<(u64, String), String> {
+    let mut rule = WindowRule::default();
+    let mut shown: Vec<&str> = Vec::with_capacity(parts.len());
+
+    for raw in parts {
+        let item = raw.trim();
+        // 允许整段留空 (`window = ""`), 等同于不限制 —— 从 Web 工具生成的配置里
+        // 很容易出现空字符串, 为此报错太不友好了。
+        if item.is_empty() {
+            continue;
+        }
+        shown.push(item);
+
+        let (negated, name) = match item.strip_prefix('!') {
+            Some(rest) => (true, rest.trim()),
+            None => (false, item),
+        };
+        if name.is_empty() {
+            return Err(format!("{label}: window 里的 \"{item}\" 少了程序名"));
+        }
+        // 只比进程的可执行文件名, 所以这里也只留文件名。用户写全路径不算错,
+        // 但要让他知道路径部分被忽略了, 免得以为能靠路径区分同名程序。
+        let file = name.rsplit(['\\', '/']).next().unwrap_or(name);
+        if file != name {
+            return Err(format!(
+                "{label}: window 只按程序名匹配, 请写 \"{file}\" 而不是完整路径 \"{name}\""
+            ));
+        }
+
+        let target = if negated {
+            &mut rule.exclude
+        } else {
+            &mut rule.include
+        };
+        let lower = file.to_lowercase();
+        if !target.contains(&lower) {
+            target.push(lower);
+        }
+    }
+
+    if rule.include.is_empty() && rule.exclude.is_empty() {
+        return Ok((0, String::new()));
+    }
+
+    // 排序后再比对, 这样 ["a","b"] 和 ["b","a"] 会合并成同一条规则
+    rule.include.sort();
+    rule.exclude.sort();
+    rule.label = shown.join(", ");
+
+    // 已经有等价的规则就复用它那一位。比的是编译后的 include/exclude 而不是
+    // label —— 写法不同但含义相同的两条 (顺序、大小写) 本就该共用一位。
+    if let Some(i) = rules
+        .iter()
+        .position(|r| r.include == rule.include && r.exclude == rule.exclude)
+    {
+        return Ok((1u64 << i, rules[i].label.clone()));
+    }
+
+    if rules.len() >= MAX_WINDOW_RULES {
+        return Err(format!(
+            "{label}: 不同的 window 条件最多 {MAX_WINDOW_RULES} 种 (写法相同的会合并)"
+        ));
+    }
+    let bit = 1u64 << rules.len();
+    let shown = rule.label.clone();
+    rules.push(rule);
+    Ok((bit, shown))
 }
 
 /// 解析 `from`: 末位是触发键, 前面的都必须是修饰键。
@@ -422,17 +552,29 @@ fn parse_from(parts: &[String], label: &str) -> Result<(Input, u16), String> {
     Ok((from, mods))
 }
 
-/// 钩子回调遍历映射时使用的顺序: **修饰键多的排在前面**。
+/// 钩子回调遍历映射时使用的顺序: **条件更具体的排在前面**。
 ///
-/// 同时配了 `E -> D` 和 `Ctrl+E -> Backspace` 时, 按住 Ctrl 应当走后者。
-/// 若按声明顺序匹配, 谁写在前面谁生效 —— 那种行为没法向用户解释。
+/// 具体程度分两级比较, 依次是:
+///
+/// 1. **修饰键多的优先**。同时配了 `E -> D` 和 `Ctrl+E -> Backspace` 时,
+///    按住 Ctrl 应当走后者。若按声明顺序匹配, 谁写在前面谁生效 ——
+///    那种行为没法向用户解释。
+/// 2. **限定了程序的优先**。`侧键@chrome -> 后退` 和 `侧键 -> Esc` 并存时,
+///    在 Chrome 里显然该走前者, 否则"给某个程序开小灶"这个用法根本没法用。
+///
+/// 修饰键排在窗口前面, 是因为修饰键要求的是用户**当下多按了键**, 比"碰巧在
+/// 哪个程序里"更能说明意图: 在 Chrome 里按 `Ctrl+E`, 该走通用的 `Ctrl+E`,
+/// 而不是 Chrome 专属的 `E`。
 ///
 /// 只影响匹配, 不影响显示: 菜单和 `--dump` 仍按配置文件里的顺序,
 /// 否则用户会发现界面上的条目莫名其妙地重排了。
-/// 用稳定排序, 所以修饰键数量相同的几条仍然保持"先到先得"。
+/// 用稳定排序, 所以具体程度相同的几条仍然保持"先到先得"。
 fn match_order(mappings: &[Mapping]) -> Vec<u32> {
     let mut order: Vec<u32> = (0..mappings.len() as u32).collect();
-    order.sort_by_key(|&i| std::cmp::Reverse(mappings[i as usize].from_mods.count_ones()));
+    order.sort_by_key(|&i| {
+        let m = &mappings[i as usize];
+        std::cmp::Reverse((m.from_mods.count_ones(), u8::from(m.has_window())))
+    });
     order
 }
 
@@ -566,6 +708,301 @@ to = "Delete"
         )
         .unwrap();
         assert!(cfg.find_conflicts().is_empty());
+    }
+
+    // ---- 按程序限定 ----
+
+    #[test]
+    fn 单个程序名编译成一条肯定规则() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "MouseX2"
+to = ["Alt", "Left"]
+window = "chrome.exe"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.uses_window);
+        assert_eq!(cfg.window_rules.len(), 1);
+        assert_eq!(cfg.window_rules[0].include, vec!["chrome.exe"]);
+        assert!(cfg.window_rules[0].exclude.is_empty());
+        assert_eq!(cfg.mappings[0].window_bit, 1);
+        assert!(cfg.mappings[0].has_window());
+    }
+
+    #[test]
+    fn 叹号前缀编译成否定规则() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = ["CapsLock", "H"]
+to = "Left"
+window = "!windowsterminal.exe"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.window_rules[0].include.is_empty());
+        assert_eq!(cfg.window_rules[0].exclude, vec!["windowsterminal.exe"]);
+    }
+
+    #[test]
+    fn 程序名不区分大小写() {
+        // 用户多半是从任务管理器抄的名字, 大小写五花八门
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "Pause"
+to = "Insert"
+window = "Chrome.EXE"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.window_rules[0].include, vec!["chrome.exe"]);
+    }
+
+    #[test]
+    fn 相同条件的映射共用同一位() {
+        // 合并是有意义的: 前台切换时只判断一次, 64 位的预算也省着用
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "Pause"
+to = "Insert"
+window = "chrome.exe"
+
+[[mappings]]
+from = "F13"
+to = "F14"
+window = "chrome.exe"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.window_rules.len(), 1, "同一个条件不该占两位");
+        assert_eq!(cfg.mappings[0].window_bit, cfg.mappings[1].window_bit);
+    }
+
+    #[test]
+    fn 写法不同但含义相同的条件也合并() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "Pause"
+to = "Insert"
+window = ["chrome.exe", "msedge.exe"]
+
+[[mappings]]
+from = "F13"
+to = "F14"
+window = ["MSEDGE.EXE", "Chrome.exe"]
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.window_rules.len(), 1, "顺序与大小写不该产生第二条规则");
+        assert_eq!(cfg.mappings[0].window_bit, cfg.mappings[1].window_bit);
+    }
+
+    #[test]
+    fn 不同条件占不同位() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "Pause"
+to = "Insert"
+window = "chrome.exe"
+
+[[mappings]]
+from = "F13"
+to = "F14"
+window = "code.exe"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.window_rules.len(), 2);
+        assert_eq!(cfg.mappings[0].window_bit, 1);
+        assert_eq!(cfg.mappings[1].window_bit, 2);
+        assert_eq!(cfg.mappings[0].window_bit & cfg.mappings[1].window_bit, 0);
+    }
+
+    #[test]
+    fn 不写window就是不限程序() {
+        let cfg = parse("[[mappings]]\nfrom = \"Pause\"\nto = \"Insert\"").unwrap();
+        assert_eq!(cfg.mappings[0].window_bit, 0);
+        assert!(!cfg.mappings[0].has_window());
+        assert!(!cfg.uses_window, "没人用就不该去装前台窗口监视");
+    }
+
+    #[test]
+    fn 空的window等同于不限程序() {
+        // Web 工具里清空输入框就会生成空串, 为此报错太不友好
+        for toml in [
+            "[[mappings]]\nfrom = \"Pause\"\nto = \"Insert\"\nwindow = \"\"",
+            "[[mappings]]\nfrom = \"Pause\"\nto = \"Insert\"\nwindow = []",
+            "[[mappings]]\nfrom = \"Pause\"\nto = \"Insert\"\nwindow = [\"  \"]",
+        ] {
+            let cfg = parse(toml).unwrap();
+            assert_eq!(cfg.mappings[0].window_bit, 0, "{toml}");
+            assert!(!cfg.uses_window, "{toml}");
+        }
+    }
+
+    #[test]
+    fn 写完整路径要报错并给出应该写什么() {
+        let e = parse(
+            r#"
+[[mappings]]
+from = "Pause"
+to = "Insert"
+window = "C:\\Program Files\\Google\\chrome.exe"
+"#,
+        )
+        .unwrap_err();
+        assert!(e.contains("只按程序名匹配"), "{e}");
+        assert!(e.contains("chrome.exe"), "报错要直接给出正确写法: {e}");
+    }
+
+    #[test]
+    fn 只有叹号没有程序名要报错() {
+        let e =
+            parse("[[mappings]]\nfrom = \"Pause\"\nto = \"Insert\"\nwindow = \"!\"").unwrap_err();
+        assert!(e.contains("少了程序名"), "{e}");
+    }
+
+    #[test]
+    fn 窗口条件不同不算冲突() {
+        // 这正是按程序区分映射的核心用法
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "MouseX2"
+to = ["Alt", "Left"]
+window = "chrome.exe"
+
+[[mappings]]
+from = "MouseX2"
+to = ["Ctrl", "Z"]
+window = "code.exe"
+"#,
+        )
+        .unwrap();
+        assert!(cfg.find_conflicts().is_empty());
+    }
+
+    #[test]
+    fn 窗口条件相同才算冲突() {
+        let cfg = parse(
+            r#"
+[[mappings]]
+from = "MouseX2"
+to = "Esc"
+window = "chrome.exe"
+
+[[mappings]]
+from = "MouseX2"
+to = "Delete"
+window = "chrome.exe"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.find_conflicts(), vec![(0, 1)]);
+    }
+
+    #[test]
+    fn 限定程序的排在通用的前面() {
+        // 声明顺序故意反着写: 通用的在前
+        let cfg = parse(
+            r#"
+[[mappings]]
+name = "通用"
+from = "MouseX2"
+to = "Esc"
+
+[[mappings]]
+name = "限定"
+from = "MouseX2"
+to = ["Alt", "Left"]
+window = "chrome.exe"
+"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = cfg
+            .order
+            .iter()
+            .map(|&i| cfg.mappings[i as usize].name.as_str())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["限定", "通用"],
+            "通用的排前面会把限定的整个盖住, 这个功能就废了"
+        );
+    }
+
+    #[test]
+    fn 修饰键比窗口条件更能说明意图() {
+        // 在 Chrome 里按 Ctrl+E, 该走通用的 Ctrl+E, 而不是 Chrome 专属的 E
+        let cfg = parse(
+            r#"
+[[mappings]]
+name = "chrome专属"
+from = "E"
+to = "D"
+window = "chrome.exe"
+
+[[mappings]]
+name = "通用组合键"
+from = ["Ctrl", "E"]
+to = "Backspace"
+"#,
+        )
+        .unwrap();
+        let names: Vec<&str> = cfg
+            .order
+            .iter()
+            .map(|&i| cfg.mappings[i as usize].name.as_str())
+            .collect();
+        assert_eq!(names, vec!["通用组合键", "chrome专属"]);
+    }
+
+    #[test]
+    fn 显示时带上限定的程序() {
+        // 不显示的话, 用户在别的程序里发现它"不工作"时完全看不出原因
+        let m = one(r#"[[mappings]]
+from = "MouseX2"
+to = ["Alt", "Left"]
+window = "chrome.exe""#);
+        assert_eq!(m.to_string(), "MouseX2 -> Alt + Left @chrome.exe");
+
+        let blocked = one(r#"[[mappings]]
+from = ["Ctrl", "W"]
+to = []
+window = "!code.exe""#);
+        assert_eq!(blocked.to_string(), "Ctrl + W -> (屏蔽) @!code.exe");
+    }
+
+    #[test]
+    fn 窗口条件超过上限要报错() {
+        let mut toml = String::new();
+        for i in 0..=MAX_WINDOW_RULES {
+            toml.push_str(&format!(
+                "[[mappings]]\nfrom = \"F13\"\nto = \"F14\"\nwindow = \"app{i}.exe\"\n\n"
+            ));
+        }
+        let e = parse(&toml).unwrap_err();
+        assert!(e.contains(&MAX_WINDOW_RULES.to_string()), "{e}");
+    }
+
+    #[test]
+    fn 恰好用满上限是允许的() {
+        let mut toml = String::new();
+        for i in 0..MAX_WINDOW_RULES {
+            toml.push_str(&format!(
+                "[[mappings]]\nfrom = \"F13\"\nto = \"F14\"\nwindow = \"app{i}.exe\"\n\n"
+            ));
+        }
+        let cfg = parse(&toml).expect("正好 64 条应当通过");
+        assert_eq!(cfg.window_rules.len(), MAX_WINDOW_RULES);
+        // 最后一条占的是最高位, 不能溢出成 0
+        assert_eq!(cfg.mappings[MAX_WINDOW_RULES - 1].window_bit, 1u64 << 63);
     }
 
     // ---- 屏蔽与 CapsLock ----

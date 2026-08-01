@@ -31,6 +31,7 @@ use windows_sys::Win32::System::Threading::GetCurrentThreadId;
 use windows_sys::Win32::UI::HiDpi::{
     DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, SetProcessDpiAwarenessContext,
 };
+use windows_sys::Win32::UI::Input::Ime::ImmDisableIME;
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GetMessageW, MSG, TranslateMessage,
 };
@@ -92,6 +93,7 @@ fn main() {
     // 必须在创建任何窗口之前声明 DPI 感知, 否则系统会对窗口做位图拉伸,
     // 菜单文字和托盘图标都会发虚。
     enable_dpi_awareness();
+    disable_ime();
 
     // 只在真的要输出时才去要控制台。--dump 之类走 println 必须有控制台;
     // 日志类输出如果已经写文件就不必再开窗口。
@@ -355,6 +357,23 @@ fn emit(text: &str, output: Option<&std::path::Path>) {
 fn enable_dpi_awareness() {
     unsafe {
         SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
+
+/// 关掉本进程的输入法。
+///
+/// keyremap 没有任何地方需要打字: 隐藏窗口只用来收托盘消息, 菜单只显示文字,
+/// 错误提示是个纯按钮的消息框。但托盘菜单弹出前必须 `SetForegroundWindow`
+/// (不抢前台的话点别处菜单不会消失), 而进程一旦成为前台, 输入法框架就会把
+/// IME 的 DLL 连同词库、皮肤资源一起加载进来 —— 在装了第三方输入法的机器上
+/// 这是几十 MB 的一次性开销, 之后不再增长, 正好对上"重载一次配置就涨到 30M
+/// 然后不动了"的现象。对一个常驻后台、自称轻量的小工具来说这笔账不划算。
+///
+/// 传 -1 表示进程内所有线程, 且必须赶在创建任何窗口之前调用。
+/// 失败无所谓: 大不了退回原来的行为。
+fn disable_ime() {
+    unsafe {
+        ImmDisableIME(u32::MAX);
     }
 }
 

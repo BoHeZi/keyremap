@@ -8,8 +8,10 @@
 //!
 //! - 用 `TPM_RETURNCMD` 让 `TrackPopupMenu` 直接返回被点中的 ID, 不绕 `WM_COMMAND`。
 //!
-//! - 承载托盘的是**普通隐藏窗口**, 不是 `HWND_MESSAGE` 消息窗口: 后者不能成为
-//!   前台窗口, `SetForegroundWindow` 会失败, 导致弹出菜单在点击别处时不消失。
+//! - 承载托盘的是**普通隐藏窗口**, 不是 `HWND_MESSAGE` 消息窗口。两个理由:
+//!   后者不能成为前台窗口, `SetForegroundWindow` 会失败, 弹出的菜单在点击别处
+//!   时不消失; 而且它收不到 `TaskbarCreated` 这类广播消息, explorer 重启后
+//!   图标就再也回不来了。改成消息窗口会同时破坏这两件事。
 
 use std::ffi::OsStr;
 use std::mem::size_of;
@@ -17,7 +19,7 @@ use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::ptr;
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicBool, AtomicIsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicIsize, AtomicU32, Ordering};
 
 use log::{debug, error, info, warn};
 use windows_sys::Win32::Foundation::{ERROR_SUCCESS, HWND, LPARAM, LRESULT, POINT, WPARAM};
@@ -30,12 +32,13 @@ use windows_sys::Win32::UI::Shell::{
     NOTIFYICONDATAW, Shell_NotifyIconW, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    AppendMenuW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyMenu,
-    DestroyWindow, GetCursorPos, GetSystemMetrics, HICON, HMENU, IDI_APPLICATION, IMAGE_ICON,
-    LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MB_ICONERROR, MB_OK, MF_CHECKED, MF_GRAYED, MF_POPUP,
-    MF_SEPARATOR, MF_STRING, MessageBoxW, PostQuitMessage, RegisterClassW, SM_CXSMICON,
-    SM_CYSMICON, SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON,
-    TrackPopupMenu, WM_APP, WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW,
+    AppendMenuW, ChangeWindowMessageFilterEx, CreatePopupMenu, CreateWindowExW, DefWindowProcW,
+    DestroyIcon, DestroyMenu, DestroyWindow, GetCursorPos, GetSystemMetrics, HICON, HMENU,
+    IDI_APPLICATION, IMAGE_ICON, LR_DEFAULTCOLOR, LoadIconW, LoadImageW, MB_ICONERROR, MB_OK,
+    MF_CHECKED, MF_GRAYED, MF_POPUP, MF_SEPARATOR, MF_STRING, MSGFLT_ALLOW, MessageBoxW,
+    PostQuitMessage, RegisterClassW, RegisterWindowMessageW, SM_CXSMICON, SM_CYSMICON,
+    SW_SHOWNORMAL, SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, WM_APP,
+    WM_DESTROY, WM_LBUTTONUP, WM_RBUTTONUP, WM_SETTINGCHANGE, WNDCLASSW,
 };
 
 use crate::{autostart, config, elevate, hook, watcher};
@@ -55,6 +58,12 @@ const ICON_LIGHT_OFF: u16 = 4;
 
 /// 当前正在用的 HICON, 换图标时用来释放上一个。
 static CURRENT_ICON: AtomicIsize = AtomicIsize::new(0);
+
+/// `TaskbarCreated` 广播消息的编号。explorer 重建托盘时发这条消息。
+///
+/// 它是运行时向系统注册出来的, 不是编译期常量, 所以只能存在这里 ——
+/// `match` 的模式要求常量, 判断它得放到 `_` 分支里用 `if` 做。
+static TASKBAR_CREATED: AtomicU32 = AtomicU32::new(0);
 
 // 菜单命令 ID。映射项从 ID_MAPPING_BASE 开始按下标顺延,
 // 这样不用保存任何 id 表, 反解一次减法就够。
@@ -129,19 +138,50 @@ pub fn init(config_path: &Path) -> Result<(), String> {
         }
         TRAY_HWND.store(hwnd as isize, Ordering::SeqCst);
 
-        let mut data = icon_data(hwnd);
-        data.uFlags = NIF_MESSAGE | NIF_TIP;
-        data.uCallbackMessage = WM_TRAY_CALLBACK;
-        fill_wide(&mut data.szTip, &status_text());
-        apply_icon(&mut data); // 会补上 NIF_ICON
+        // explorer 崩溃或重启时, 托盘里所有图标的注册信息都随它一起没了,
+        // 系统只广播这条消息通知各程序自己加回去, 不会替谁恢复。
+        // 广播只送到顶层窗口 —— 这是不用 HWND_MESSAGE 窗口的又一个理由。
+        let name = wide("TaskbarCreated");
+        let taskbar_created = RegisterWindowMessageW(name.as_ptr());
+        if taskbar_created == 0 {
+            warn!("注册 TaskbarCreated 消息失败, explorer 重启后托盘图标不会自动恢复");
+        } else {
+            TASKBAR_CREATED.store(taskbar_created, Ordering::SeqCst);
+            // 以管理员身份运行时本进程是高完整性级别, 而 explorer 是中等,
+            // UIPI 会默默丢掉它广播过来的消息, 上面那套就白装了。
+            // 单独给这一条消息开个口子, 别的消息照旧挡着。
+            if ChangeWindowMessageFilterEx(hwnd, taskbar_created, MSGFLT_ALLOW, ptr::null_mut())
+                == 0
+            {
+                warn!("放行 TaskbarCreated 消息失败, 提权运行时托盘图标可能无法恢复");
+            }
+        }
 
-        if Shell_NotifyIconW(NIM_ADD, &data) == 0 {
+        if !add_icon(hwnd) {
             DestroyWindow(hwnd);
             return Err("添加托盘图标失败".into());
         }
         debug!("托盘图标已创建");
     }
     Ok(())
+}
+
+/// 把图标注册进托盘。首次创建与 explorer 重启后的重新注册都走这里,
+/// 两条路必须产出完全一样的图标, 否则重启后会出现状态或提示对不上的图标。
+unsafe fn add_icon(hwnd: HWND) -> bool {
+    unsafe {
+        // 先删一次。explorer 重启的正常情况下这步注定失败 —— 注册信息本来就
+        // 随它一起没了 —— 但图标万一还在 (比如广播收到两次), 不先删掉后面的
+        // NIM_ADD 就会失败, 白报一条看着很吓人的错误。删不掉没有副作用。
+        Shell_NotifyIconW(NIM_DELETE, &icon_data(hwnd));
+
+        let mut data = icon_data(hwnd);
+        data.uFlags = NIF_MESSAGE | NIF_TIP;
+        data.uCallbackMessage = WM_TRAY_CALLBACK;
+        fill_wide(&mut data.szTip, &status_text());
+        apply_icon(&mut data); // 会补上 NIF_ICON
+        Shell_NotifyIconW(NIM_ADD, &data) != 0
+    }
 }
 
 /// 移除托盘图标并销毁窗口。
@@ -251,7 +291,20 @@ unsafe extern "system" fn wnd_proc(
             unsafe { PostQuitMessage(0) };
             0
         }
-        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+        _ => {
+            // explorer 重启, 托盘图标要自己加回去。消息编号是运行时注册的,
+            // 进不了上面的 match 模式, 只能在这里比。
+            let taskbar_created = TASKBAR_CREATED.load(Ordering::Relaxed);
+            if taskbar_created != 0 && msg == taskbar_created {
+                if unsafe { add_icon(hwnd) } {
+                    info!("explorer 已重启, 托盘图标重新注册");
+                } else {
+                    warn!("explorer 重启后重新注册托盘图标失败");
+                }
+                return 0;
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
     }
 }
 

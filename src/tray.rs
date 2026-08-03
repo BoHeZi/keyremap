@@ -240,7 +240,8 @@ fn status_text() -> String {
         .map(|c| c.active_count())
         .unwrap_or(0);
     format!(
-        "keyremap — {} ({n} 条映射生效){}{}",
+        "keyremap {} — {} ({n} 条映射生效){}{}",
+        env!("CARGO_PKG_VERSION"),
         if hook::is_enabled() {
             "已启用"
         } else {
@@ -317,6 +318,13 @@ unsafe fn show_menu(hwnd: HWND) {
     }
 
     unsafe {
+        // 版本号做成灰色标题放在最上面。排查问题时第一句话往往是"你用的哪个版本",
+        // 摆在这里一眼能看到; 灰色表示不可点, 也就不会被误触。
+        // ID 给 0 是安全的: TPM_RETURNCMD 用 0 表示"什么都没选中"。
+        let title = wide(concat!("keyremap ", env!("CARGO_PKG_VERSION")));
+        AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, title.as_ptr());
+        AppendMenuW(menu, MF_SEPARATOR, 0, ptr::null());
+
         let label = wide("启用映射");
         AppendMenuW(
             menu,
@@ -853,6 +861,25 @@ mod tests {
         fill_wide(&mut buf, "abcdefgh");
         assert_eq!(buf[3], 0, "最后一位必须是终止符");
         assert_eq!(&buf[..3], &[b'a' as u16, b'b' as u16, b'c' as u16]);
+    }
+
+    /// 悬停提示必须带版本号。
+    ///
+    /// 排查问题时第一件要确认的就是版本, 而悬停提示是唯一不用点开菜单
+    /// 就能看到的地方。顺带守住长度: `szTip` 只有 128 个 UTF-16 单元,
+    /// 超了会被 `fill_wide` 悄悄截掉, 而截断往往先吃掉末尾的状态标记。
+    #[test]
+    fn 悬停提示带版本号且不会被截断() {
+        let text = status_text();
+        assert!(
+            text.contains(env!("CARGO_PKG_VERSION")),
+            "提示里没有版本号: {text}"
+        );
+        let units = text.encode_utf16().count();
+        assert!(
+            units < 128,
+            "提示占 {units} 个 UTF-16 单元, 会被截断: {text}"
+        );
     }
 
     /// 四个图标 ID 必须都能从内嵌资源里取到。

@@ -498,7 +498,10 @@ mod tests {
 
     #[test]
     fn xml_转义特殊字符() {
-        assert_eq!(xml_escape(r#"a&b<c>d"e'f"#), "a&amp;b&lt;c&gt;d&quot;e&apos;f");
+        assert_eq!(
+            xml_escape(r#"a&b<c>d"e'f"#),
+            "a&amp;b&lt;c&gt;d&quot;e&apos;f"
+        );
         // 含 & 的目录不罕见, 不转义就是一份坏 XML
         let xml = task_xml(&PathBuf::from(r"D:\a&b\my.toml")).unwrap();
         assert!(xml.contains("a&amp;b"));

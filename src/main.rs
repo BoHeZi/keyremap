@@ -196,7 +196,9 @@ fn main() {
     let mut preloaded = Some(cfg);
     loop {
         // 重来一轮得重新加载: 上一轮的配置已经交给 hook 了
-        let cfg = preloaded.take().unwrap_or_else(|| load_or_die(&config_path));
+        let cfg = preloaded
+            .take()
+            .unwrap_or_else(|| load_or_die(&config_path));
 
         if !run_session(&config_path, cfg) {
             break;

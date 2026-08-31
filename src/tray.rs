@@ -555,9 +555,15 @@ fn toggle_run_as_admin() {
     if turn_on && !elevate::is_elevated() {
         info!("已记下管理员偏好, 需要提权重启才能生效");
         notify("即将以管理员身份重启", "请在 UAC 确认框里允许");
-        // 只置标记, 真正的重启在 main 里做 —— 那时单实例锁已经释放
-        RESTART_AS_ADMIN.store(true, Ordering::SeqCst);
-        unsafe { PostQuitMessage(0) };
+        // 自启已开的话先把 Run 项换成当前口径, 提权后再由 sync 转成计划任务。
+        // 不做这步的话, 用户在提权中途取消, 留下的可能是一条都没有的状态。
+        if autostart::is_enabled()
+            && let Some(path) = CONFIG_PATH.get()
+            && let Err(e) = autostart::enable(path)
+        {
+            warn!("提权前保底写入自启项失败: {e}");
+        }
+        request_restart_as_admin();
         return;
     }
 
@@ -568,6 +574,15 @@ fn toggle_run_as_admin() {
         "已关闭: 下次启动起以普通权限运行"
     });
     update_status();
+}
+
+/// 请求以管理员身份重启。
+///
+/// 只置标记, 真正的重启在 main 里做 —— 那时单实例锁已经释放, 否则新实例
+/// 会被旧实例的锁挡在门外。
+fn request_restart_as_admin() {
+    RESTART_AS_ADMIN.store(true, Ordering::SeqCst);
+    unsafe { PostQuitMessage(0) };
 }
 
 /// 按当前偏好重新落实自启机制。没开自启就什么都不用做。
@@ -581,38 +596,69 @@ fn apply_autostart_for_current_pref(msg: &str) {
     };
     // enable 内部会按偏好在 Run 项与计划任务之间选一个, 并清掉另一个
     match autostart::enable(path) {
-        Ok(()) => {
+        Ok(autostart::Enabled::Done) => {
             info!("{msg}");
             notify("keyremap", msg);
         }
+        // 走到这儿说明偏好是管理员但当前没权限。enable 已经写了 Run 项保底,
+        // 提权重启后 main 里的 sync 会把它换成计划任务。
+        Ok(autostart::Enabled::NeedsElevation) => {
+            info!("{msg}; 自启暂以普通方式记下, 提权重启后转为计划任务");
+            notify("即将以管理员身份重启", "请在 UAC 确认框里允许");
+            request_restart_as_admin();
+        }
         Err(e) => {
             error!("调整自启机制失败: {e}");
-            notify("自启设置失败", &e);
+            show_error("keyremap: 自启设置失败", &e);
         }
     }
 }
 
 fn toggle_autostart() {
     let turn_on = !autostart::is_enabled();
-    let result = match CONFIG_PATH.get() {
-        Some(path) if turn_on => autostart::enable(path),
-        Some(_) => autostart::disable(),
-        None => Err("配置路径未知".to_string()),
+
+    let Some(path) = CONFIG_PATH.get() else {
+        error!("配置路径未知, 无法设置自启动");
+        show_error("keyremap: 设置自启动失败", "配置路径未知");
+        return;
     };
 
-    match result {
-        Ok(()) => {
-            let msg = if turn_on {
-                "已设置为开机自启动"
-            } else {
-                "已取消开机自启动"
-            };
-            info!("{msg}");
-            notify("keyremap", msg);
+    if !turn_on {
+        match autostart::disable() {
+            Ok(()) => {
+                info!("已取消开机自启动");
+                notify("keyremap", "已取消开机自启动");
+            }
+            Err(e) => {
+                error!("取消自启动失败: {e}");
+                show_error("keyremap: 取消自启动失败", &e);
+            }
+        }
+        return;
+    }
+
+    match autostart::enable(path) {
+        Ok(autostart::Enabled::Done) => {
+            info!("已设置为开机自启动");
+            notify("keyremap", "已设置为开机自启动");
+        }
+        // 开着"以管理员身份启动"却还没有管理员权限。以前这里直接报错,
+        // 结果是一条自启都没设上, 而提示只是个几秒就消失的气泡 ——
+        // 用户以为设好了, 重启后才发现没起来。现在 Run 项已经写上保底,
+        // 提权重启后 sync 再把它换成计划任务。
+        Ok(autostart::Enabled::NeedsElevation) => {
+            info!("自启已先按普通方式记下, 需要提权后才能转为计划任务");
+            notify(
+                "即将以管理员身份重启",
+                "自启需要管理员权限才能设置完整, 请在 UAC 确认框里允许",
+            );
+            request_restart_as_admin();
         }
         Err(e) => {
             error!("设置自启动失败: {e}");
-            notify("设置自启动失败", &e);
+            // 用消息框而不是气泡: 自启是"设了就不再管"的功能, 失败提示
+            // 一闪而过的话用户要到下次开机才发现, 那时已经想不起来了。
+            show_error("keyremap: 设置自启动失败", &e);
         }
     }
 }

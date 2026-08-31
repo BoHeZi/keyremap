@@ -166,15 +166,7 @@ fn main() {
     }
     info!("加载配置: {}", config_path.display());
 
-    let cfg = match config::load(&config_path) {
-        Ok(c) => c,
-        Err(e) => {
-            error!("{e}");
-            // GUI 子系统下没有控制台时错误会彻底消失, 用消息框兜底
-            tray::show_error("keyremap: 配置加载失败", &e);
-            std::process::exit(1);
-        }
-    };
+    let cfg = load_or_die(&config_path);
 
     // 输入源撞车的话在这里就说出来, 别等用户按了半天发现某条从来没生效
     config::warn_conflicts(&cfg);
@@ -199,6 +191,56 @@ fn main() {
         warn!("提权未成功, 以普通权限继续运行 (对管理员权限的窗口将不生效)");
     }
 
+    // 会话循环。正常只跑一轮; 用户点了"以管理员身份启动"而 UAC 又被取消时
+    // 会回到这里再跑一轮 —— 见循环末尾。
+    let mut preloaded = Some(cfg);
+    loop {
+        // 重来一轮得重新加载: 上一轮的配置已经交给 hook 了
+        let cfg = preloaded.take().unwrap_or_else(|| load_or_die(&config_path));
+
+        if !run_session(&config_path, cfg) {
+            break;
+        }
+
+        // 单实例锁已随 run_session 返回而释放, 现在起新进程才不会被自己挡住。
+        info!("正在以管理员身份重启");
+        if elevate::restart_as_admin(&config_path) {
+            break;
+        }
+
+        // UAC 被取消。以前这里丢掉返回值就结束了 —— 用户点一下菜单, 程序
+        // 凭空消失; 而偏好已经写进注册表, 之后每次启动都要再弹一次 UAC。
+        // 回滚偏好并接着以普通权限跑完这一轮。
+        warn!("提权被取消, 恢复为普通权限运行");
+        if let Err(e) = elevate::set_wants_admin(false) {
+            warn!("恢复管理员偏好失败: {e}");
+        }
+        // 用消息框而不是气泡: 这是用户刚点下菜单的直接回应, 必须看得见
+        tray::show_error(
+            "keyremap",
+            "未获得管理员权限, 已恢复为普通权限运行。\n需要时可以在托盘菜单里重新开启「以管理员身份启动」。",
+        );
+    }
+}
+
+/// 加载配置, 失败就报错退出。GUI 子系统下没有控制台时错误会彻底消失,
+/// 所以除了日志还要弹一个消息框兜底。
+fn load_or_die(config_path: &std::path::Path) -> config::Config {
+    match config::load(config_path) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("{e}");
+            tray::show_error("keyremap: 配置加载失败", &e);
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 一轮完整的运行: 拿锁、装钩子、跑消息循环、清理。
+///
+/// 返回 true 表示用户在托盘里要求以管理员身份重启。单实例锁随本函数返回
+/// 一起释放, 调用方那时才能安全地启动新进程。
+fn run_session(config_path: &std::path::Path, cfg: config::Config) -> bool {
     // 单实例检查放在装钩子之前。多个实例各装一套低级钩子会互相干扰:
     // 事件被逐层处理, 表现为"禁用了却还在生效"这类难以排查的现象。
     //
@@ -243,14 +285,14 @@ fn main() {
     // 让自启机制与"以管理员启动"偏好保持一致。
     // 用户刚打开该偏好时还没有权限建计划任务, 提权重启后由这里补上,
     // 并把旧的 Run 项清掉。幂等, 已经一致时不做任何写入。
-    if let Err(e) = autostart::sync(&config_path) {
+    if let Err(e) = autostart::sync(config_path) {
         warn!("自启机制同步失败: {e}");
     }
 
     // 文件监听要在托盘之前起来, 这样启动后立刻改配置也不会漏掉。
     // Debouncer 必须持有到程序结束, drop 掉监听就停了。
     let main_thread = unsafe { GetCurrentThreadId() };
-    let _watcher = match watcher::spawn(&config_path, main_thread) {
+    let _watcher = match watcher::spawn(config_path, main_thread) {
         Ok(w) => Some(w),
         Err(e) => {
             // 监听失败不致命: 大不了退回手动重载
@@ -259,7 +301,7 @@ fn main() {
         }
     };
 
-    if let Err(e) = tray::init(&config_path) {
+    if let Err(e) = tray::init(config_path) {
         error!("{e}");
         hook::uninstall();
         std::process::exit(1);
@@ -272,12 +314,9 @@ fn main() {
     hook::uninstall();
     foreground::uninstall();
 
-    // 提权重启必须放在释放单实例锁之后, 否则新实例会被自己的旧锁挡在门外。
-    if tray::take_restart_request() {
-        drop(_instance);
-        info!("正在以管理员身份重启");
-        elevate::restart_as_admin(&config_path);
-    }
+    // 单实例锁随 _instance 在这里 drop。提权重启必须发生在那之后,
+    // 否则新实例会被自己的旧锁挡在门外 —— 所以只回报意向, 由调用方去做。
+    tray::take_restart_request()
 }
 
 /// 按组列出配置。

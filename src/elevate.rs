@@ -31,8 +31,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
 
 use crate::regutil;
 
-/// 存放本程序自己的设置。目前只有一个"是否以管理员运行"。
-const APP_KEY: &str = r"Software\keyremap";
+/// 存放本程序自己的设置。除了这里的"是否以管理员运行",
+/// [`autostart`](crate::autostart) 也往同一个键下写任务的格式版本。
+pub(crate) const APP_KEY: &str = r"Software\keyremap";
 const VALUE_RUN_AS_ADMIN: &str = "RunAsAdmin";
 
 /// 用户是否要求本程序总是以管理员身份运行。

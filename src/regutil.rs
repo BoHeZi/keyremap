@@ -93,13 +93,35 @@ pub fn write_dword(root: HKEY, sub: &str, name: &str, value: u32) -> Result<(), 
     }
 }
 
-/// 读字符串值。缓冲区固定 2KB —— 我们只用来存命令行, 够了。
+/// 读字符串值。
+///
+/// 先问长度再按需分配, 不用固定缓冲区: 值超过缓冲区时 `RegQueryValueExW`
+/// 返回 `ERROR_MORE_DATA` 而不是截断, 把那当成"值不存在"会让
+/// `autostart::run_entry_is_self` 误判成未启用自启。
 pub fn read_string(root: HKEY, sub: &str, name: &str) -> Option<String> {
     let key = open(root, sub, KEY_QUERY_VALUE)?;
     let name_w = wide(name);
-    let mut buf = [0u16; 1024];
-    let mut size = (buf.len() * 2) as u32;
 
+    // 数据指针传 null 时只回填所需字节数
+    let mut size = 0u32;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            name_w.as_ptr(),
+            ptr::null(),
+            ptr::null_mut(),
+            ptr::null_mut(),
+            &mut size,
+        )
+    };
+    if rc != ERROR_SUCCESS || size == 0 {
+        unsafe { RegCloseKey(key) };
+        return None;
+    }
+
+    // size 是字节数, 奇数字节向上取整成完整的 u16
+    let mut buf = vec![0u16; size.div_ceil(2) as usize];
+    let mut size = (buf.len() * 2) as u32;
     let rc = unsafe {
         RegQueryValueExW(
             key,
@@ -115,9 +137,12 @@ pub fn read_string(root: HKEY, sub: &str, name: &str) -> Option<String> {
     if rc != ERROR_SUCCESS {
         return None;
     }
-    // size 是字节数且含结尾的 NUL
-    let len = (size as usize / 2).saturating_sub(1);
-    Some(String::from_utf16_lossy(&buf[..len.min(buf.len())]))
+    // 注册表**不保证** REG_SZ 以 NUL 结尾, 所以按实际出现的 NUL 截断
+    // 而不是无条件把最后一个字符当结束符减掉 —— 后者会吃掉真实字符。
+    let len = (size as usize / 2).min(buf.len());
+    let data = &buf[..len];
+    let end = data.iter().position(|&c| c == 0).unwrap_or(len);
+    Some(String::from_utf16_lossy(&data[..end]))
 }
 
 pub fn write_string(root: HKEY, sub: &str, name: &str, value: &str) -> Result<(), String> {
@@ -193,6 +218,19 @@ mod tests {
 
         delete_value(HKEY_CURRENT_USER, TEST_KEY, "cmd").unwrap();
         assert_eq!(read_string(HKEY_CURRENT_USER, TEST_KEY, "cmd"), None);
+    }
+
+    /// 固定 1024 个 u16 的旧实现会在这里拿到 ERROR_MORE_DATA 并返回 None,
+    /// 于是"自启已启用"被误判成未启用。
+    #[test]
+    fn 超长字符串不会被当成不存在() {
+        let value = "x".repeat(4096);
+        write_string(HKEY_CURRENT_USER, TEST_KEY, "long", &value).expect("写入应当成功");
+        assert_eq!(
+            read_string(HKEY_CURRENT_USER, TEST_KEY, "long").as_deref(),
+            Some(value.as_str())
+        );
+        delete_value(HKEY_CURRENT_USER, TEST_KEY, "long").unwrap();
     }
 
     #[test]

@@ -69,7 +69,10 @@ fn scoop_current_dir_checked(exe: &Path) -> Option<PathBuf> {
 /// 单实例名同样按 exe 路径哈希, 用带版本号的路径会让"是否已启用自启"的判断
 /// 在每次升级后失灵, 于是托盘里的勾莫名消失、旧的计划任务变成孤儿。
 ///
-/// 通过 shim 启动时拿到的本来就是 `current` 那条, 这里是无操作。
+/// scoop 的 shim (`scoop\shims\keyremap.exe`) **匹配不上**这个布局 —— 它的祖父
+/// 目录叫 `scoop` 而不是 `apps`。好在 shim 只是个转发器: 它照 `.shim` 文件里
+/// 记的路径去 CreateProcess 起真正的 exe, 而那条路径本来就指向 `current`,
+/// 所以真正跑起来的进程在这里是无操作。
 pub fn stable_exe() -> PathBuf {
     let exe = std::env::current_exe().unwrap_or_default();
     match (scoop_current_dir_checked(&exe), exe.file_name()) {
